@@ -220,17 +220,6 @@ def create_latents(shape: tuple, seed: int = 42) -> np.ndarray:
     return latents.numpy()
 
 
-def apply_vae_scaling(
-    latent: np.ndarray, vae_scaling_factor: float, vae_shift_factor: float
-) -> np.ndarray:
-    """
-    Scales the latent before VAE decoding.
-    """
-    if vae_scaling_factor == 0.0:
-        raise ValueError("VAE scaling factor cannot be zero.")
-    return latent / vae_scaling_factor + vae_shift_factor
-
-
 def convert_vae_decoded_image_to_pixels(
     normalized_float_output_vae: np.ndarray, channels: int, width: int, height: int
 ) -> np.ndarray:
@@ -317,37 +306,6 @@ class Scheduler:
             log_tensor_stats(self.sigmas_, "sigmas")
             log_tensor_stats(self.timesteps_, "timesteps")
 
-    def step(self, noise_pred, timestep, latents):
-        if self.step_index_ >= self.num_inference_steps_:
-            raise ValueError("Invalid step_index_.")
-
-        sigma_idx = self.step_index_
-        sigma = self.sigmas_[sigma_idx]
-        sigma_next = self.sigmas_[sigma_idx + 1]
-
-        current_sigma = sigma
-        next_sigma = sigma_next
-        dt = sigma_next - sigma
-
-        """
-        print(f"sigma_idx {sigma_idx}")
-        print(f"sigma {sigma}")
-        print(f"sigma_next {sigma_next}")
-        print(f"dt {dt}")
-        """
-
-        latents_prev = latents - dt * noise_pred
-
-        """
-        log_tensor_stats(noise_pred, "noise_pred")
-        log_tensor_stats(latent, "latent")
-        log_tensor_stats(prev_latent, "prev_latent")
-        """
-
-        self.step_index_ += 1
-
-        return latents_prev
-
 
 class ZImagePipeline:
     def __init__(
@@ -362,6 +320,10 @@ class ZImagePipeline:
         dev_transformer_path: str = "",
         dev_text_encoder_path: str = "",
         dev_vae_decoder_path: str = "",
+        dev_scheduler_step_path: str = "",
+        dev_vae_pre_process_path: str = "",
+        dev_sc_prep_path: str = "",
+        use_safety_checker: bool = False,
     ):
         print("ZImagePipeline")
         self.path_ = path
@@ -372,6 +334,14 @@ class ZImagePipeline:
         self.text_encoder_model_ = "onnx/text_encoder_model_q4f16.onnx"
         self.transformer_model_ = "onnx/transformer_model_q4f16.onnx"
         self.vae_decoder_model_ = "onnx/vae_decoder_model_f16.onnx"
+
+        # Small helper graphs the WebNN demo uses to keep intermediate tensors GPU-resident:
+        # scheduler_step does the flow-matching Euler latent update, vae_pre_process does the
+        # squeeze + VAE scale/shift, and sc_prep + safety_checker are the optional NSFW check.
+        self.scheduler_step_model_ = "onnx/scheduler_step_model_f16.onnx"
+        self.vae_pre_process_model_ = "onnx/vae_pre_process_model_f16.onnx"
+        self.sc_prep_model_ = "onnx/sc_prep_model_f16.onnx"
+        self.safety_checker_model_ = "onnx/safety_checker_model_f16.onnx"
 
         # --transformer: swap in the onnxruntime-genai-exported z-transformer (see
         # build_z_image_turbo.py / builders/zimage.py in onnxruntime-genai) instead of the
@@ -403,6 +373,35 @@ class ZImagePipeline:
         if dev_vae_decoder_path:
             self.vae_decoder_model_ = os.path.abspath(dev_vae_decoder_path)
             print(f"Using dev VAE decoder: {self.vae_decoder_model_}")
+
+        # --scheduler_step / --vae_pre_process / --sc_prep: swap in self-built helper graphs
+        # (build_z_image_turbo.py -m helper_models) instead of the WebNN bundle's. Unlike the
+        # bundle graphs, these have no `num_frames` axis (latents/noise_pred are plain
+        # [1, 16, H, W], matching the dev transformer) and may have a genuine float16 I/O
+        # boundary. Both the dtype and the shape convention (frame-axis or not) are
+        # auto-detected from each loaded session in initialize_scheduler_step/
+        # initialize_vae_pre_process below, so any combination of bundle/self-built helpers
+        # works.
+        self.using_dev_scheduler_step_ = bool(dev_scheduler_step_path)
+        if self.using_dev_scheduler_step_:
+            self.scheduler_step_model_ = os.path.abspath(dev_scheduler_step_path)
+            print(f"Using dev scheduler step: {self.scheduler_step_model_}")
+
+        self.using_dev_vae_pre_process_ = bool(dev_vae_pre_process_path)
+        if self.using_dev_vae_pre_process_:
+            self.vae_pre_process_model_ = os.path.abspath(dev_vae_pre_process_path)
+            print(f"Using dev VAE pre process: {self.vae_pre_process_model_}")
+
+        self.using_dev_sc_prep_ = bool(dev_sc_prep_path)
+        if self.using_dev_sc_prep_:
+            self.sc_prep_model_ = os.path.abspath(dev_sc_prep_path)
+            print(f"Using dev sc_prep: {self.sc_prep_model_}")
+
+        # --safety_checker: opt-in NSFW check mirroring the WebNN demo's optional
+        # sc_prep -> safety_checker path. Loads the extra ~580 MB safety_checker model and its
+        # runtime is deliberately NOT counted in the pipeline's total-time metric (it runs after
+        # the total time is printed, exactly like the JS demo).
+        self.use_safety_checker_ = use_safety_checker
 
         #  Get supported providers
         available_providers = ort.get_available_providers()
@@ -459,12 +458,31 @@ class ZImagePipeline:
         self.tokenizer_ = None
         self.text_encoder_sess_ = None
         self.transformer_sess_ = None
+        self.scheduler_step_sess_ = None
+        self.vae_pre_process_sess_ = None
         self.vae_decoder_sess_ = None
+        self.sc_prep_sess_ = None
+        self.safety_checker_sess_ = None
+
+        # scheduler_step/vae_pre_process/sc_prep dtype and shape convention, auto-detected from
+        # the loaded session's declared input types (see initialize_scheduler_step /
+        # initialize_vae_pre_process / initialize_safety_checker). has_frame_axis defaults to
+        # True (the bundle's convention) until a session is actually loaded.
+        self.transformer_dtype_ = None
+        self.transformer_has_frame_axis_ = True
+        self.scheduler_step_dtype_ = None
+        self.scheduler_step_has_frame_axis_ = True
+        self.vae_pre_process_dtype_ = None
+        self.vae_pre_process_has_frame_axis_ = True
+        self.sc_prep_dtype_ = None
+        self.safety_checker_dtype_ = None
 
         # tensors
         self.latents_current_ = None
         self.input_ids_ = None
         self.prompt_embeds_ = None
+        self.noise_pred_ = None
+        self.scaled_latents_ = None
         self.vae_decoded_image_ = None
 
         self.prompt_length_ = 0
@@ -503,7 +521,13 @@ class ZImagePipeline:
             return False
         if not self.initialize_transformer():
             return False
+        if not self.initialize_scheduler_step():
+            return False
+        if not self.initialize_vae_pre_process():
+            return False
         if not self.initialize_vae_decoder():
+            return False
+        if self.use_safety_checker_ and not self.initialize_safety_checker():
             return False
         return True
 
@@ -545,26 +569,40 @@ class ZImagePipeline:
             print(f"transformer-{i} time: {exec_time:.2f} ms")
             total_exec_time += exec_time
 
+            # Flow-matching Euler latent update via the scheduler_step helper model.
+            start_time = time.perf_counter()
+            if not self.run_scheduler_step(i):
+                return False
+            end_time = time.perf_counter()
+            exec_time = (end_time - start_time) * 1000
+            print(f"scheduler_step-{i} time: {exec_time:.2f} ms")
+            total_exec_time += exec_time
+
             # write every step image for debug, skip last
             if self.all_images_ and i < self.num_inference_steps_ - 1:
                 path = Path(name)
                 output_name = path.stem + f"-step{i}" + path.suffix
-                if not self.run_vae_decoder():
+                if not self.decode_current_latents():
                     return False
                 self.write_image(output_name)
 
         # write final image
         start_time = time.perf_counter()
-        if not self.run_vae_decoder():
+        if not self.decode_current_latents():
             return False
         end_time = time.perf_counter()
         exec_time = (end_time - start_time) * 1000
-        print(f"vae_decoder time: {exec_time:.2f} ms")
+        print(f"vae time: {exec_time:.2f} ms")
         total_exec_time += exec_time
 
         print(f"total time: {total_exec_time:.2f} ms")
 
         self.write_image(name)
+
+        # Optional NSFW safety check. Runs AFTER total time is reported and its latency is
+        # intentionally excluded from total_exec_time (matches the WebNN demo's sequencing).
+        if self.use_safety_checker_:
+            self.run_safety_checker()
 
         return True
 
@@ -707,18 +745,23 @@ class ZImagePipeline:
             for output in outputs:
                 print(f"output: {output}")
 
-            # The dev z-transformer's I/O dtype is a build-time choice (e.g. `-p int4 -e
-            # webgpu` exports float16 I/O) and isn't guaranteed to match the WebNN text
-            # encoder's output dtype that `self.model_dtype_` is derived from. Query the
-            # transformer's own `hidden_states` input dtype instead of assuming they match.
-            self.transformer_dtype_ = self.model_dtype_
-            if self.using_dev_transformer_:
-                hidden_states_input = next(i for i in inputs if i.name == "hidden_states")
-                if hidden_states_input.type == "tensor(float16)":
-                    self.transformer_dtype_ = np.float16
-                else:
-                    self.transformer_dtype_ = np.float32
-                print(f"Dev transformer dtype: {self.transformer_dtype_}")
+            # The transformer's I/O dtype is a build-time choice (e.g. `-p int4 -e webgpu`
+            # exports float16 I/O) and isn't guaranteed to match the WebNN text encoder's output
+            # dtype that `self.model_dtype_` is derived from. The bundle's `hidden_states` is
+            # [batch, 16, 1, H, W] (rank 5, has a num_frames axis); the self-built transformer's
+            # is [1, 16, H, W] (rank 4, no frame axis). Detect both dtype and rank from the
+            # loaded graph instead of assuming which one it is from --transformer alone (a
+            # self-built transformer_model_q4f16.onnx dropped into a bundle-shaped directory has
+            # the same filename as the bundle's own transformer).
+            hidden_states_input = next(i for i in inputs if i.name == "hidden_states")
+            self.transformer_dtype_ = (
+                np.float16 if hidden_states_input.type == "tensor(float16)" else np.float32
+            )
+            self.transformer_has_frame_axis_ = len(hidden_states_input.shape) == 5
+            print(
+                f"Transformer dtype: {self.transformer_dtype_}, "
+                f"has_frame_axis: {self.transformer_has_frame_axis_}"
+            )
 
             return True
         except Exception as e:
@@ -728,13 +771,13 @@ class ZImagePipeline:
     def run_transformer(self, timestep: float) -> bool:
         print("======\nRun transformer.")
 
-        latents_input = self.latents_current_.astype(self.transformer_dtype_)
-        timestep_input = np.array([timestep], dtype=self.transformer_dtype_)
-        prompt_embeds_input = self.prompt_embeds_.astype(self.transformer_dtype_)
-
-        if self.using_dev_transformer_:
+        latents_input = self.latents_current_
+        if not self.transformer_has_frame_axis_:
             # (Batch, Channels, NumFrames=1, Height, Width) -> (Batch, Channels, Height, Width)
             latents_input = np.squeeze(latents_input, axis=2)
+        latents_input = latents_input.astype(self.transformer_dtype_)
+        timestep_input = np.array([timestep], dtype=self.transformer_dtype_)
+        prompt_embeds_input = self.prompt_embeds_.astype(self.transformer_dtype_)
 
         if self.verbose_:
             log_tensor_stats(timestep_input, "timestep")
@@ -749,23 +792,144 @@ class ZImagePipeline:
             outputs = self.transformer_sess_.run(None, ort_inputs)
             noise_pred = outputs[0]
 
-            if self.using_dev_transformer_:
+            if not self.transformer_has_frame_axis_:
                 # (Batch, Channels, Height, Width) -> (Batch, Channels, NumFrames=1, Height, Width)
                 noise_pred = np.expand_dims(noise_pred, axis=2)
 
             if self.verbose_:
                 log_tensor_stats(noise_pred, "noise_pred")
 
-            self.latents_current_ = self.scheduler_.step(
-                noise_pred, 1000, self.latents_current_
+            # The Euler latent update is now done by run_scheduler_step (scheduler_step model).
+            self.noise_pred_ = noise_pred
+
+            return True
+        except Exception as e:
+            print(f"Error running transformer: {e}")
+            return False
+
+    def initialize_scheduler_step(self) -> bool:
+        print(f"======\nInitialize Scheduler Step: {self.scheduler_step_model_}")
+        model_path = os.path.join(self.path_, self.scheduler_step_model_)
+        try:
+            self.scheduler_step_sess_ = ort.InferenceSession(
+                model_path, providers=self.providers_
             )
+            inputs = self.scheduler_step_sess_.get_inputs()
+            for input in inputs:
+                print(f"input: {input}")
+            for output in self.scheduler_step_sess_.get_outputs():
+                print(f"output: {output}")
+
+            # The bundle's `latents` is [batch, 16, 1, H, W] (rank 5, has a num_frames axis);
+            # our self-built helper's is [1, 16, H, W] (rank 4, no frame axis). Detect both the
+            # rank and the dtype from the loaded graph instead of assuming the bundle's.
+            latents_input = next(i for i in inputs if i.name == "latents")
+            self.scheduler_step_dtype_ = (
+                np.float16 if latents_input.type == "tensor(float16)" else np.float32
+            )
+            self.scheduler_step_has_frame_axis_ = len(latents_input.shape) == 5
+            print(
+                f"Scheduler Step dtype: {self.scheduler_step_dtype_}, "
+                f"has_frame_axis: {self.scheduler_step_has_frame_axis_}"
+            )
+            return True
+        except Exception as e:
+            print(f"Error initializing Scheduler Step: {e}")
+            return False
+
+    def run_scheduler_step(self, step_index: int) -> bool:
+        print("======\nRun scheduler step.")
+
+        # scheduler_step wants noise_pred/latents shaped [16, 1, H, W] (bundle, no batch) or
+        # [1, 16, H, W] (self-built, no frame axis) depending on which graph is loaded.
+        h, w = self.noise_pred_.shape[-2], self.noise_pred_.shape[-1]
+        dtype = self.scheduler_step_dtype_
+        if self.scheduler_step_has_frame_axis_:
+            noise_pred = self.noise_pred_.reshape(
+                self.LatentChannels_, self.LatentNumFrames_, h, w
+            ).astype(dtype)
+            latents = self.latents_current_.astype(dtype)
+        else:
+            noise_pred = self.noise_pred_.reshape(1, self.LatentChannels_, h, w).astype(dtype)
+            latents = self.latents_current_.reshape(1, self.LatentChannels_, h, w).astype(dtype)
+
+        # step_info = [current_step_index, num_inference_steps]; the graph derives the sigma
+        # schedule internally (shift=3) and returns latents - (sigma_next - sigma) * noise_pred.
+        step_info = np.array([step_index, self.num_inference_steps_], dtype=dtype)
+
+        ort_inputs = {
+            "noise_pred": noise_pred,
+            "latents": latents,
+            "step_info": step_info,
+        }
+
+        try:
+            outputs = self.scheduler_step_sess_.run(None, ort_inputs)
+            out = outputs[0]
+            if not self.scheduler_step_has_frame_axis_:
+                out = out.reshape(1, self.LatentChannels_, self.LatentNumFrames_, h, w)
+            self.latents_current_ = out.astype(np.float32)
 
             if self.verbose_:
                 log_tensor_stats(self.latents_current_, "latents_next")
 
             return True
         except Exception as e:
-            print(f"Error running transformer: {e}")
+            print(f"Error running scheduler step: {e}")
+            return False
+
+    def initialize_vae_pre_process(self) -> bool:
+        print(f"======\nInitialize VAE Pre Process: {self.vae_pre_process_model_}")
+        model_path = os.path.join(self.path_, self.vae_pre_process_model_)
+        try:
+            self.vae_pre_process_sess_ = ort.InferenceSession(
+                model_path, providers=self.providers_
+            )
+            inputs = self.vae_pre_process_sess_.get_inputs()
+            for input in inputs:
+                print(f"input: {input}")
+            for output in self.vae_pre_process_sess_.get_outputs():
+                print(f"output: {output}")
+
+            # Bundle's `latents` is [batch, 16, 1, H, W] (rank 5); self-built helper's is
+            # [1, 16, H, W] (rank 4, no frame axis to squeeze).
+            latents_input = next(i for i in inputs if i.name == "latents")
+            self.vae_pre_process_dtype_ = (
+                np.float16 if latents_input.type == "tensor(float16)" else np.float32
+            )
+            self.vae_pre_process_has_frame_axis_ = len(latents_input.shape) == 5
+            print(
+                f"VAE Pre Process dtype: {self.vae_pre_process_dtype_}, "
+                f"has_frame_axis: {self.vae_pre_process_has_frame_axis_}"
+            )
+            return True
+        except Exception as e:
+            print(f"Error initializing VAE Pre Process: {e}")
+            return False
+
+    def run_vae_pre_process(self) -> bool:
+        print("======\nRun VAE Pre Process.")
+
+        # Bundle helper does squeeze(axis=2) + scale/shift; self-built helper has no frame axis
+        # to squeeze, so we drop it here before feeding (latents_current_'s canonical shape
+        # always keeps the frame axis for the rest of the pipeline).
+        dtype = self.vae_pre_process_dtype_
+        if self.vae_pre_process_has_frame_axis_:
+            latents = self.latents_current_.astype(dtype)
+        else:
+            latents = np.squeeze(self.latents_current_, axis=2).astype(dtype)
+        ort_inputs = {"latents": latents}
+
+        try:
+            outputs = self.vae_pre_process_sess_.run(None, ort_inputs)
+            self.scaled_latents_ = outputs[0].astype(np.float32)
+
+            if self.verbose_:
+                log_tensor_stats(self.scaled_latents_, "scaled_latents_input")
+
+            return True
+        except Exception as e:
+            print(f"Error running VAE Pre Process: {e}")
             return False
 
     def initialize_vae_decoder(self) -> bool:
@@ -803,14 +967,8 @@ class ZImagePipeline:
     def run_vae_decoder(self) -> bool:
         print("======\nRun VAE Decoder.")
 
-        latents = np.squeeze(self.latents_current_, axis=2)
-        scaled_latents_input = apply_vae_scaling(
-            latents, self.vae_scaling_factor_, self.vae_shift_factor_
-        )
-        if self.verbose_:
-            log_tensor_stats(scaled_latents_input, "scaled_latents_input")
-
-        ort_inputs = {"latent_sample": scaled_latents_input.astype(self.vae_dtype_)}
+        # scaled_latents is produced by run_vae_pre_process (the vae_pre_process helper model).
+        ort_inputs = {"latent_sample": self.scaled_latents_.astype(self.vae_dtype_)}
 
         try:
             outputs = self.vae_decoder_sess_.run(None, ort_inputs)
@@ -819,6 +977,78 @@ class ZImagePipeline:
             return True
         except Exception as e:
             print(f"Error running VAE Decoder: {e}")
+            return False
+
+    def decode_current_latents(self) -> bool:
+        # vae_pre_process helper (squeeze + scale/shift) -> VAE decoder.
+        if not self.run_vae_pre_process():
+            return False
+        if not self.run_vae_decoder():
+            return False
+        return True
+
+    def initialize_safety_checker(self) -> bool:
+        print(
+            f"======\nInitialize Safety Checker: {self.sc_prep_model_} + "
+            f"{self.safety_checker_model_}"
+        )
+        sc_prep_path = os.path.join(self.path_, self.sc_prep_model_)
+        safety_checker_path = os.path.join(self.path_, self.safety_checker_model_)
+        try:
+            self.sc_prep_sess_ = ort.InferenceSession(
+                sc_prep_path, providers=self.providers_
+            )
+            self.safety_checker_sess_ = ort.InferenceSession(
+                safety_checker_path, providers=self.providers_
+            )
+
+            # sc_prep's shape convention (pixel-space [B,3,H,W] -> [B,3,224,224]) is the same
+            # for the bundle and self-built versions; only the dtype can differ. safety_checker
+            # is always the unchanged bundle model, but its expected `clip_input` dtype is
+            # independent of sc_prep's output dtype (e.g. a self-built fp16 sc_prep feeding the
+            # bundle's fp32-only safety_checker), so query it separately too.
+            sample_input = next(i for i in self.sc_prep_sess_.get_inputs() if i.name == "sample")
+            self.sc_prep_dtype_ = (
+                np.float16 if sample_input.type == "tensor(float16)" else np.float32
+            )
+            clip_input_input = next(
+                i for i in self.safety_checker_sess_.get_inputs() if i.name == "clip_input"
+            )
+            self.safety_checker_dtype_ = (
+                np.float16 if clip_input_input.type == "tensor(float16)" else np.float32
+            )
+            print(
+                f"sc_prep dtype: {self.sc_prep_dtype_}, "
+                f"safety_checker dtype: {self.safety_checker_dtype_}"
+            )
+            return True
+        except Exception as e:
+            print(f"Error initializing Safety Checker: {e}")
+            return False
+
+    def run_safety_checker(self) -> bool:
+        # Optional NSFW check: sc_prep resizes + CLIP-normalizes the raw VAE image, then
+        # safety_checker classifies it. Timed and printed separately; NOT part of total time.
+        if self.vae_decoded_image_ is None:
+            print("No image to run the safety checker on.")
+            return False
+
+        print("======\nRun Safety Checker.")
+        start_time = time.perf_counter()
+        try:
+            clip_input = self.sc_prep_sess_.run(
+                None, {"sample": self.vae_decoded_image_.astype(self.sc_prep_dtype_)}
+            )[0]
+            has_nsfw = self.safety_checker_sess_.run(
+                None, {"clip_input": clip_input.astype(self.safety_checker_dtype_)}
+            )[0]
+            nsfw = bool(np.asarray(has_nsfw).ravel()[0])
+            exec_time = (time.perf_counter() - start_time) * 1000
+            print(f"safety_checker time (excluded from total): {exec_time:.2f} ms")
+            print(f"Safety Checker - NSFW: {'Yes' if nsfw else 'No'}")
+            return True
+        except Exception as e:
+            print(f"Error running Safety Checker: {e}")
             return False
 
     def write_image(self, name: str) -> bool:
@@ -910,8 +1140,9 @@ if __name__ == "__main__":
         metavar="PATH",
         help=(
             "Path to an onnxruntime-genai-exported z-transformer model.onnx "
-            "(build_z_image_turbo.py -m transformer) to use instead of the bundled WebNN "
-            "transformer. See --text_encoder and --vae_decoder for the other two models."
+            "(build_z_image_turbo.py -m transformer, or onnx/transformer_model_<precision>.onnx "
+            "from -m all) to use instead of the bundled WebNN transformer. See --text_encoder "
+            "and --vae_decoder for the other two models."
         ),
     )
     parser.add_argument(
@@ -921,9 +1152,55 @@ if __name__ == "__main__":
         metavar="PATH",
         help=(
             "Path to an onnxruntime-genai-built Qwen3 text encoder "
-            "(build_z_image_turbo.py -m text_encoder, e.g. .../text_encoder_model_q4f16.onnx) "
-            "to use instead of the bundled WebNN text encoder. It's a drop-in for the bundle's "
-            "onnx/text_encoder_model_q4f16.onnx."
+            "(build_z_image_turbo.py -m text_encoder or -m all, e.g. "
+            ".../text_encoder_model_q4f16.onnx) to use instead of the bundled WebNN text "
+            "encoder. It's a drop-in for the bundle's onnx/text_encoder_model_q4f16.onnx."
+        ),
+    )
+    parser.add_argument(
+        "--safety_checker",
+        action="store_true",
+        default=False,
+        help=(
+            "Run the optional NSFW safety checker (the bundle's sc_prep + "
+            "safety_checker_model_f16.onnx, ~580 MB extra). Its runtime is printed separately "
+            "and is NOT included in the pipeline's total-time metric."
+        ),
+    )
+    parser.add_argument(
+        "--scheduler_step",
+        type=str,
+        default="",
+        metavar="PATH",
+        help=(
+            "Path to a self-built scheduler_step helper model "
+            "(build_z_image_turbo.py -m helper_models or -m all, f16 or f32) to use instead of "
+            "the bundled WebNN scheduler_step_model_f16.onnx. It's a drop-in -- shape "
+            "convention and dtype are auto-detected from the loaded graph."
+        ),
+    )
+    parser.add_argument(
+        "--vae_pre_process",
+        type=str,
+        default="",
+        metavar="PATH",
+        help=(
+            "Path to a self-built vae_pre_process helper model "
+            "(build_z_image_turbo.py -m helper_models or -m all, f16 or f32) to use instead of "
+            "the bundled WebNN vae_pre_process_model_f16.onnx. It's a drop-in -- shape "
+            "convention and dtype are auto-detected from the loaded graph."
+        ),
+    )
+    parser.add_argument(
+        "--sc_prep",
+        type=str,
+        default="",
+        metavar="PATH",
+        help=(
+            "Path to a self-built sc_prep helper model (build_z_image_turbo.py -m "
+            "helper_models or -m all, f16 or f32) to use instead of the bundled WebNN "
+            "sc_prep_model_f16.onnx. Only used with --safety_checker; dtype is auto-detected "
+            "from the loaded graph."
         ),
     )
     parser.add_argument(
@@ -952,6 +1229,10 @@ if __name__ == "__main__":
     print(f"transformer: {args.transformer}")
     print(f"text_encoder: {args.text_encoder}")
     print(f"vae_decoder: {args.vae_decoder}")
+    print(f"safety_checker: {args.safety_checker}")
+    print(f"scheduler_step: {args.scheduler_step}")
+    print(f"vae_pre_process: {args.vae_pre_process}")
+    print(f"sc_prep: {args.sc_prep}")
 
     if not os.path.exists(args.model):
         print(f"\n❌ ERROR: Model path not found!")
@@ -973,12 +1254,31 @@ if __name__ == "__main__":
         print(f"       The path '{args.vae_decoder}' does not exist.")
         sys.exit(1)
 
+    if args.scheduler_step and not os.path.exists(args.scheduler_step):
+        print(f"\n❌ ERROR: --scheduler_step model path not found!")
+        print(f"       The path '{args.scheduler_step}' does not exist.")
+        sys.exit(1)
+
+    if args.vae_pre_process and not os.path.exists(args.vae_pre_process):
+        print(f"\n❌ ERROR: --vae_pre_process model path not found!")
+        print(f"       The path '{args.vae_pre_process}' does not exist.")
+        sys.exit(1)
+
+    if args.sc_prep and not os.path.exists(args.sc_prep):
+        print(f"\n❌ ERROR: --sc_prep model path not found!")
+        print(f"       The path '{args.sc_prep}' does not exist.")
+        sys.exit(1)
+
     pipeline = ZImagePipeline(
         args.model, args.ep, args.num_inference_steps,
         args.height, args.width, args.verbose, args.all_images,
         dev_transformer_path=args.transformer,
         dev_text_encoder_path=args.text_encoder,
         dev_vae_decoder_path=args.vae_decoder,
+        dev_scheduler_step_path=args.scheduler_step,
+        dev_vae_pre_process_path=args.vae_pre_process,
+        dev_sc_prep_path=args.sc_prep,
+        use_safety_checker=args.safety_checker,
     )
     pipeline.initialize()
 
