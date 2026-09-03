@@ -110,6 +110,32 @@ class ZImageTransformerModel(Model):
         self.ff_gate_scale = 1.0 / 8.0
         self.ff_up_scale = 1.0 / 16.0
 
+        # `to_out`'s and `w3`'s scale (above) each feed a *bias-free* Linear directly, with
+        # nothing nonlinear in between -- `Linear(c*x) == c*Linear(x)` exactly, so instead of a
+        # runtime `Mul` before the Linear, the same `c` can be baked into that Linear's weight
+        # (and bias, if it had one) once at build time, for free. `feed_forward.w1`'s gate scale
+        # can't use this trick: it's applied *after* `SiLU`, which is nonlinear, so folding it
+        # into `w1`'s weight would change the function computed, not just rescale its output.
+        #
+        # With that in place, `ff_gate_scale`/`ff_up_scale`'s 8/16 split of the FFN's combined
+        # 1/128 guard no longer has to stay split: the two factors only need to multiply out to
+        # 1/128, so putting the *entire* 1/128 on `up` alone (still foldable into `w3`) and
+        # leaving `gate` unscaled gives the exact same final product magnitude
+        # (`gate_raw * (up_raw/128) == (gate_raw/8) * (up_raw/16)`) while dropping the gate's
+        # runtime `Mul` too -- the FFN then costs zero runtime scale ops instead of one, and
+        # `to_out`'s is free as well, so every float16 overflow-guard `Mul` this model would
+        # otherwise emit is eliminated. This redistribution is *not* a pure no-op refactor like
+        # the weight-fold itself, though: it changes `gate`'s and `up`'s own intermediate
+        # magnitudes, not just their product, and the 8/16 split is called out in this file's
+        # history as "the validated post-export `apply_scaledown_d_fix_all` strategy" -- so it
+        # may have been tuned for a reason beyond just the final-product overflow bound (e.g.
+        # `w3`'s int4 quantization headroom, or margin on outlier inputs). Verify the generated
+        # image still matches the reference before trusting this in production.
+        #
+        # Off by default (preserves the exact op graph this model shipped with); opt in with
+        # `--extra_options fold_scale_into_weights=True`.
+        self.fold_scale_into_weights = extra_options.get("fold_scale_into_weights", False)
+
     # ------------------------------------------------------------------
     # Weight loading
     # ------------------------------------------------------------------
@@ -519,6 +545,29 @@ class ZImageTransformerModel(Model):
             scale = self.pre_out_proj_scale
         return self._mul(name, [root_input, self._const(self.io_dtype, scale)], shape)
 
+    def _maybe_fold_scale_into_weight(self, linear, scale):
+        """If enabled (`--extra_options fold_scale_into_weights=True`), bake `scale` into
+        `linear`'s weight/bias in place and return `True`; otherwise return `False` and do
+        nothing, leaving the caller to apply `scale` at runtime via `_rescale_preout`.
+
+        Only valid when `linear` is the *very next* op to consume the scaled value, with
+        nothing nonlinear in between (see the `__init__` note by `fold_scale_into_weights`):
+        `Linear(c*x) == c*Linear(x)` exactly for a bias-free Linear (and holds for a biased
+        one too as long as the bias is scaled by the same `c`), so this is a free, exact
+        substitute for the runtime `Mul` `_rescale_preout` would otherwise emit. Must run
+        *before* `_linear` builds `linear`'s `MatMul` node, since that's when the weight
+        initializer's value is captured.
+        """
+        if not (self.fold_scale_into_weights and self.io_dtype == ir.DataType.FLOAT16):
+            return False
+        # In-place: `linear.weight`/`.bias` are `nn.Parameter`s, and `Module.__setattr__`
+        # rejects assigning a plain `Tensor` (the result of `weight * scale`) back to them.
+        with torch.no_grad():
+            linear.weight.mul_(scale)
+            if getattr(linear, "bias", None) is not None:
+                linear.bias.mul_(scale)
+        return True
+
     def _make_attention(self, name, x, num_tokens_shape, cos_cache, sin_cache, position_ids, attn):
         shape3 = [1, num_tokens_shape, self.dim]
         q = self._linear(f"{name}/to_q", x, attn.to_q, shape3)
@@ -546,7 +595,8 @@ class ZImageTransformerModel(Model):
         # unsafe across this model's differently-sized sequences. Re-stamp with the real one.
         self.make_value(attn_out, self.io_dtype, shape=shape3)
 
-        attn_out = self._rescale_preout(f"{name}/to_out/PreScale", attn_out, shape3)
+        if not self._maybe_fold_scale_into_weight(attn.to_out[0], self.pre_out_proj_scale):
+            attn_out = self._rescale_preout(f"{name}/to_out/PreScale", attn_out, shape3)
         return self._linear(f"{name}/to_out", attn_out, attn.to_out[0], shape3)
 
     def _make_feed_forward(self, name, x, num_tokens_shape, ff):
@@ -554,13 +604,25 @@ class ZImageTransformerModel(Model):
         hidden_shape = [1, num_tokens_shape, ff.w1.out_features]
         gate = self._linear(f"{name}/w1", x, ff.w1, hidden_shape)
         gate = self._silu(f"{name}/w1_silu", gate, hidden_shape)
-        up = self._linear(f"{name}/w3", x, ff.w3, hidden_shape)
         # float16 overflow protection: split the 1/128 pre-`w2` scale across the two SwiGLU
-        # factors (1/8 on the SiLU gate, 1/16 on w3) and apply it *before* the elementwise
+        # factors (default 1/8 on the SiLU gate, 1/16 on w3; or 1/1 and 1/128 with
+        # `fold_scale_into_weights=True`, see `__init__`) and apply it *before* the elementwise
         # multiply, so neither the product nor the w2 matmul that consumes it can overflow.
-        # `ffn_norm2` (RMSNorm) downstream absorbs the 1/128. No-op for float32 I/O.
-        gate = self._rescale_preout(f"{name}/w1_silu/PreScale", gate, hidden_shape, self.ff_gate_scale)
-        up = self._rescale_preout(f"{name}/w3/PreScale", up, hidden_shape, self.ff_up_scale)
+        # `ffn_norm2` (RMSNorm) downstream absorbs the 1/128. No-op for float32 I/O. The gate
+        # factor is applied *after* `SiLU` (nonlinear), so it can't be folded into `w1`'s
+        # weight and always costs a runtime `Mul` (unless redistributed away entirely); the
+        # w3/up factor precedes only a bias-free Linear, so `fold_scale_into_weights` can bake
+        # it into `w3` for free instead -- must happen before `_linear` builds `w3`'s `MatMul`.
+        if self.fold_scale_into_weights:
+            gate_scale, up_scale = 1.0, self.ff_gate_scale * self.ff_up_scale
+        else:
+            gate_scale, up_scale = self.ff_gate_scale, self.ff_up_scale
+        if gate_scale != 1.0:
+            gate = self._rescale_preout(f"{name}/w1_silu/PreScale", gate, hidden_shape, gate_scale)
+        up_folded = self._maybe_fold_scale_into_weight(ff.w3, up_scale)
+        up = self._linear(f"{name}/w3", x, ff.w3, hidden_shape)
+        if not up_folded:
+            up = self._rescale_preout(f"{name}/w3/PreScale", up, hidden_shape, up_scale)
         gated = self._mul(f"{name}/Gated", [gate, up], hidden_shape)
         return self._linear(f"{name}/w2", gated, ff.w2, shape3)
 

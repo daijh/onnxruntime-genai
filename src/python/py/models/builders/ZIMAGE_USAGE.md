@@ -55,9 +55,26 @@ python builder.py \
 
 This works with any of the usual `-p`/`-e` combinations this tool supports (e.g.
 `-p int4 -e webgpu`) — every `Linear` in the exported graph goes through the same
-quantization path as every other model here, so `-p int4`/`-p int8` "just work". No new
-`--extra_options` are introduced for this model; existing quantization options
-(`int4_block_size`/`accuracy_level`/etc., see `README.md`) apply as-is.
+quantization path as every other model here, so `-p int4`/`-p int8` "just work". Existing
+quantization options (`int4_block_size`/`accuracy_level`/etc., see `README.md`) apply as-is.
+
+One model-specific option: `--extra_options fold_scale_into_weights=True` removes every
+float16 overflow-guard `Mul` node this model would otherwise emit (see "float16
+Dynamic-Range Overflow" in `ZIMAGE_DESIGN.md`), in two steps:
+
+1. `to_out`'s and `w3`'s scale each feed straight into a bias-free Linear with nothing
+   nonlinear in between, so `Linear(c*x) == c*Linear(x)` exactly — the scale is baked into
+   those Linears' weights at build time instead of a runtime `Mul` before each.
+   Mathematically identical output.
+2. With that in place, the FFN's combined 1/128 guard no longer needs to stay split 8/16
+   across the SwiGLU gate and up operands — the whole 1/128 moves onto `up` alone (still
+   foldable into `w3`), and `gate` is left unscaled, dropping its runtime `Mul` too. This step
+   is **not** a pure no-op refactor like step 1: it changes `gate`'s and `up`'s own
+   intermediate magnitudes, not just their product, and the original 8/16 split was
+   empirically validated — **verify the generated image still matches the reference before
+   trusting this in production.**
+
+Off by default (preserves the exact op graph this model shipped with).
 
 Example matching this repo's existing `build_model.py` wrapper convention (WebGPU INT4):
 

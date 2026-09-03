@@ -392,6 +392,17 @@ if __name__ == "__main__":
             "applies (no int4 quantization)."
         ),
     )
+    parser.add_argument(
+        "--extra_options",
+        nargs="*",
+        default=[],
+        metavar="KEY=VALUE",
+        help=(
+            "Extra key=value options forwarded to builder.py's --extra_options, on top of "
+            "this script's own static ones (e.g. fold_scale_into_weights=True). Only applies "
+            "to the default -m transformer build."
+        ),
+    )
     args = parser.parse_args()
 
     model_name = os.path.basename(os.path.normpath(args.input))
@@ -448,5 +459,6 @@ if __name__ == "__main__":
             "input": transformer_dir,
             "output": output,
             "precision": args.precision,
+            "extra_options": " ".join(args.extra_options),
         }
         build_model(model_config)

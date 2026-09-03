@@ -172,6 +172,7 @@ def check_extra_options(
         "prune_lm_head",
         "use_paged_attention",
         "windowed_kv_cache",
+        "fold_scale_into_weights",
     ]
 
     for key in bools:
