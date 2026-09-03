@@ -576,22 +576,41 @@ class ZImageTransformerModel(Model):
     # LayerNorm without affine params (`FinalLayer.norm_final`)
     # ------------------------------------------------------------------
     def _layer_norm_no_affine(self, name, root_input, shape, eps=1e-6):
-        reduced_shape = shape[:-1] + [1]
-        axes = self._const(ir.DataType.INT64, [-1])
+        """Standard (mean-subtracting) LayerNorm without affine params (`FinalLayer.norm_final`).
 
-        mean_name = f"{name}/Mean"
-        self.make_reduce_mean(mean_name, [root_input, axes], self.io_dtype, reduced_shape, keepdims=True)
-        diff_name = f"{name}/Diff"
-        self.make_sub(diff_name, [root_input, f"{mean_name}/output_0"], self.io_dtype, shape)
-        sq_name = f"{name}/Sq"
-        self.make_mul(sq_name, [f"{diff_name}/output_0", f"{diff_name}/output_0"], self.io_dtype, shape)
-        var_name = f"{name}/Var"
-        self.make_reduce_mean(var_name, [f"{sq_name}/output_0", axes], self.io_dtype, reduced_shape, keepdims=True)
-        var_eps = self._add_scalar(f"{name}/VarEps", f"{var_name}/output_0", eps, reduced_shape)
-        std_name = f"{name}/Std"
-        self.make_sqrt(std_name, [var_eps], self.io_dtype, reduced_shape)
-        self.make_div(name, [f"{diff_name}/output_0", f"{std_name}/output_0"], self.io_dtype, shape)
-        return f"{name}/output_0"
+        Emitted as the fused `LayerNormalization` op with `stash_type=1`, so ONNX Runtime
+        computes the mean/variance -- including the `(x-mean)^2` accumulation -- in float32
+        internally regardless of `io_dtype`. That range is required: the pre-norm hidden
+        state's squared deviation reaches ~2e6 on real inputs (see ZIMAGE_DESIGN.md's
+        "float16 Dynamic-Range Overflow"), which overflows float16 (max ~65504) to `Inf` and
+        collapses the output to a garbled image on a true-float16 backend (WebGPU/WebNN). The
+        bug is masked on the CPU EP (which upcasts float16 math to float32) and absent in the
+        `-p f32*` builds, so it only surfaces on-device. Fusing matches the reference export
+        (whose `norm_final` is the identical fused op) and every other norm in this graph
+        (`SimplifiedLayerNormalization`, also `stash_type=1`); the earlier hand-decomposed
+        form computed `(x-mean)^2` in `io_dtype`, which is exactly what overflowed.
+
+        `norm_final` has no learnable affine, so `scale` is all-ones and `bias` all-zeros --
+        both materialized (as the reference does) since ONNX `LayerNormalization` requires the
+        scale input; the AdaLN scale/shift is applied separately by the caller.
+        """
+        dim = shape[-1]
+        base = name[1:].replace("/", ".")
+        scale_name, bias_name = f"{base}.scale_ones", f"{base}.bias_zeros"
+        self.make_initializer(torch.ones(dim), scale_name, to=self.io_dtype)
+        self.make_initializer(torch.zeros(dim), bias_name, to=self.io_dtype)
+        output = f"{name}/output_0"
+        self.make_node(
+            "LayerNormalization",
+            inputs=[root_input, scale_name, bias_name],
+            outputs=[output],
+            name=name,
+            axis=-1,
+            epsilon=eps,
+            stash_type=1,
+        )
+        self.make_value(output, self.io_dtype, shape=shape)
+        return output
 
     # ------------------------------------------------------------------
     # Sequence concatenation / slicing
