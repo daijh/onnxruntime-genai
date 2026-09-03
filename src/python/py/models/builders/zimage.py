@@ -700,7 +700,8 @@ class ZImageTransformerModel(Model):
 
         x_embedder = self.weights.all_x_embedder[self.patch_key]
         img_tokens = self._linear(
-            "/model/z_image/x_embedder", img_patches_b, x_embedder, [1, "img_seq_len", self.dim]
+            "/model/z_image/x_embedder", img_patches_b, x_embedder, [1, "img_seq_len", self.dim],
+            exclude_from_quant=True,
         )
 
         # --- caption embed ---
@@ -709,7 +710,8 @@ class ZImageTransformerModel(Model):
             [1, "cap_seq_len", self.cap_feat_dim],
         )
         cap_tokens = self._linear(
-            "/model/z_image/cap_embedder_linear", cap_norm, self.weights.cap_embedder[1], [1, "cap_seq_len", self.dim]
+            "/model/z_image/cap_embedder_linear", cap_norm, self.weights.cap_embedder[1], [1, "cap_seq_len", self.dim],
+            exclude_from_quant=True,
         )
 
         # --- timestep / AdaLN input ---
