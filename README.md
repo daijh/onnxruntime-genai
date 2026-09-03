@@ -21,7 +21,9 @@ All of the exporter code lives under `src/python/py/models/`:
 | [`src/python/py/models/builders/zimage.py`](src/python/py/models/builders/zimage.py) | `ZImageTransformerModel`, the transformer-trunk exporter itself |
 | [`src/python/py/models/builders/zimage_text_encoder.py`](src/python/py/models/builders/zimage_text_encoder.py) | `strip_to_text_encoder`, post-processes a genai-built Qwen3 decoder into the text encoder |
 | [`src/python/py/models/builders/zimage_vae.py`](src/python/py/models/builders/zimage_vae.py) | `ZImageVAEDecoderModel`, the VAE decoder exporter (see [ZIMAGE_VAE_DESIGN.md](src/python/py/models/builders/ZIMAGE_VAE_DESIGN.md) / [ZIMAGE_VAE_USAGE.md](src/python/py/models/builders/ZIMAGE_VAE_USAGE.md)) |
-| [`src/python/py/models/build_z_image_turbo.py`](src/python/py/models/build_z_image_turbo.py) | CLI wrapper for building the transformer (all precision variants) and the text encoder |
+| [`src/python/py/models/build_z_image_turbo.py`](src/python/py/models/build_z_image_turbo.py) | CLI wrapper for building the transformer, text encoder, helper models, safety checker, VAE decoder, or all of them at once |
+| [`src/python/py/models/builders/zimage_helper_models.py`](src/python/py/models/builders/zimage_helper_models.py) | `build_helper_models`, builds the scheduler_step/vae_pre_process/sc_prep helper graphs, shaped for the self-built transformer |
+| [`src/python/py/models/builders/zimage_safety_checker.py`](src/python/py/models/builders/zimage_safety_checker.py) | `build_safety_checker`, exports the NSFW safety checker from the pretrained CLIP checkpoint |
 | [`src/python/py/models/run_z_image_turbo.py`](src/python/py/models/run_z_image_turbo.py) | Standalone end-to-end text-to-image pipeline driver that can run the exported transformer |
 | [`src/python/py/models/builders/ZIMAGE_DESIGN.md`](src/python/py/models/builders/ZIMAGE_DESIGN.md) | Architecture, scope, and design rationale |
 | [`src/python/py/models/builders/ZIMAGE_USAGE.md`](src/python/py/models/builders/ZIMAGE_USAGE.md) | Full build/run/verify walkthrough, using `builder.py` directly |
@@ -40,7 +42,7 @@ See [ZIMAGE_DESIGN.md#scope](src/python/py/models/builders/ZIMAGE_DESIGN.md#scop
 full list of what's out of scope (SigLIP/Omni conditioning, LoRA, ControlNet, multiple patch
 sizes, gradient checkpointing).
 
-## Quick Start: Building the Model
+## Quick Start
 
 ```bash
 cd src/python/py/models
@@ -54,10 +56,20 @@ from huggingface_hub import snapshot_download
 snapshot_download("Tongyi-MAI/Z-Image-Turbo", local_dir="path_to_local_folder")
 ```
 
-Build with [`build_z_image_turbo.py`](src/python/py/models/build_z_image_turbo.py), which
-wraps `builder.py` with the WebGPU EP and the extra options this model needs pre-filled in.
-`-m/--model` selects the component (default `transformer`); pick one of four transformer
-precisions with `-p`:
+This is enough to build the transformer, text encoder, helper models, and VAE decoder.
+`-m safety_checker` and `-m all` also need a second, separate checkpoint — see
+[Building the Safety Checker](#building-the-safety-checker) below.
+
+Everything is built with [`build_z_image_turbo.py`](src/python/py/models/build_z_image_turbo.py),
+which wraps `builder.py` with the WebGPU EP and the extra options each component needs
+pre-filled in. `-m/--model` selects which component to build — `transformer` (default),
+`text_encoder`, `helper_models`, `safety_checker`, `vae_decoder`, or `all` — see the matching
+section below for each, or [Building Everything at Once](#building-everything-at-once) for the
+one-command path.
+
+## Building the Transformer
+
+Pick one of four precisions with `-p`:
 
 ```bash
 python build_z_image_turbo.py path_to_local_folder -m transformer -p <precision>
@@ -112,6 +124,123 @@ is fixed to q4f16 (float16 output); `-p` is ignored for `-m text_encoder`.
 `text_encoder/` weights together with the sibling `tokenizer/` files (hardlinked, not copied)
 before building, then removes the staging directory afterward.
 
+## Building the Helper Models
+
+The WebNN bundle also ships 3 tiny helper ONNX graphs that keep intermediate tensors off the
+CPU: `scheduler_step_model_f16.onnx` (the flow-matching Euler latent update),
+`vae_pre_process_model_f16.onnx` (squeeze + VAE scale/shift before decode), and
+`sc_prep_model_f16.onnx` (resize + CLIP normalize for the safety checker). Those are shaped for
+the WebNN transformer's `[*, 16, 1, H, W]` latents (a `num_frames` axis our self-built
+transformer doesn't have) and always use a float32 I/O boundary.
+
+`-m helper_models` builds our own versions of these 3 graphs (via
+[`builders/zimage_helper_models.py`](src/python/py/models/builders/zimage_helper_models.py)),
+shaped like the self-built transformer's `[1, 16, H, W]` (no frame axis), in a genuine float16
+I/O boundary as well as float32:
+
+```bash
+cd src/python/py/models
+pip install onnxconverter_common  # in addition to the deps above
+python build_z_image_turbo.py path_to_local_folder -m helper_models -p f16
+```
+
+`-p` only differentiates `f16`/`f32` here (the `_int4_quant` half is ignored, and a bare
+`-p f32`/`f32_int4_quant` builds the f32 variant) — run it twice for both, the same as building
+both transformer precisions. Output goes to
+`<model_name>-helper_models-genai-wgpu-<f16|f32>/<scheduler_step|vae_pre_process|sc_prep>_model_<precision>.onnx`;
+the build verifies each graph against a pure-numpy reference immediately after building it. The
+math (sigma schedule, VAE scale/shift, CLIP normalization constants) matches the deployed bundle
+graphs exactly — only the shape (no frame axis) and float16 boundary are new.
+
+## Building the Safety Checker
+
+The NSFW safety checker (the bundle's `sc_prep` companion) is a real pretrained CLIP ViT-L/14
+vision classifier — a cosine-distance threshold check against 17 "concept" and 3 "special care"
+reference embeddings — not something authored from scratch. It's exported from the standard
+public checkpoint `CompVis/stable-diffusion-safety-checker` via
+[`builders/zimage_safety_checker.py`](src/python/py/models/builders/zimage_safety_checker.py),
+using `diffusers`' own `forward_onnx` method (with the `images`-masking input/output trimmed off,
+since only `clip_input -> has_nsfw_concepts` is needed). Download the checkpoint once, the same
+way as the main Z-Image-Turbo checkpoint:
+
+```py
+from huggingface_hub import snapshot_download
+snapshot_download("CompVis/stable-diffusion-safety-checker", local_dir="path_to_safety_checker_folder")
+```
+
+Then build:
+
+```bash
+python build_z_image_turbo.py path_to_local_folder -m safety_checker -p f16 \
+  --safety_checker_checkpoint path_to_safety_checker_folder
+```
+
+`-p` only differentiates `f16`/`f32`, same as `-m helper_models`. Output goes to
+`<model_name>-safety_checker-genai-wgpu-<f16|f32>/safety_checker_model_<precision>.onnx`. Verified
+against the deployed bundle's `safety_checker_model_f16.onnx`: every named weight tensor
+(`concept_embeds`, `special_care_embeds`, the CLIP vision encoder weights, etc.) matches
+bit-for-bit (mod float16 rounding) — same checkpoint — and `has_nsfw_concepts` agrees across
+randomized inputs run through both graphs in `onnxruntime`.
+
+## Building the VAE Decoder
+
+The VAE decoder itself is documented in full in
+[ZIMAGE_VAE_DESIGN.md](src/python/py/models/builders/ZIMAGE_VAE_DESIGN.md) /
+[ZIMAGE_VAE_USAGE.md](src/python/py/models/builders/ZIMAGE_VAE_USAGE.md), including the
+`fuse_group_norm` GroupNorm flavour and int4/int8 mid-block quantization. `-m vae_decoder` is a
+thin convenience wrapper around that same `builders/zimage_vae.py` exporter, for when you just
+want an unquantized `f16`/`f32` decoder without the extra options:
+
+```bash
+python build_z_image_turbo.py path_to_local_folder -m vae_decoder -p f16
+```
+
+`-p` only differentiates `f16`/`f32`, same as `-m helper_models`/`-m safety_checker`. Output goes
+to `<model_name>-vae_decoder-genai-wgpu-<f16|f32>/vae_decoder_model_<precision>.onnx` — a
+self-contained file (weights inline, no `.onnx.data`), a drop-in for the WebNN bundle's
+`onnx/vae_decoder_model_f16.onnx`.
+
+## Building Everything at Once
+
+`-m all` builds the transformer, text encoder, helper models, safety checker, and VAE decoder in
+one command, into a single bundle-shaped directory (`--safety_checker_checkpoint` is required):
+
+```bash
+python build_z_image_turbo.py path_to_local_folder -m all -p f16_int4_quant \
+  --safety_checker_checkpoint path_to_safety_checker_folder
+```
+
+Output goes to `<model_name>-genai-wgpu-<precision>/`, laid out like the WebNN bundle itself:
+
+```
+<model_name>-genai-wgpu-<precision>/
+  onnx/
+    transformer_model_<f16|f32|q4f16|q4f32>.onnx(.data)
+    text_encoder_model_q4f16.onnx(_data)
+    scheduler_step_model_<f16|f32>.onnx
+    vae_pre_process_model_<f16|f32>.onnx
+    sc_prep_model_<f16|f32>.onnx
+    safety_checker_model_<f16|f32>.onnx
+    vae_decoder_model_<f16|f32>.onnx
+  tokenizer/
+    ...
+```
+
+The transformer filename suffix matches `-p` exactly (`f16`/`f32`/`f16_int4_quant`->`q4f16`/
+`f32_int4_quant`->`q4f32`, mirroring the WebNN bundle's own `transformer_model_q4f16.onnx`
+convention). Everything else's precision is derived from `-p`'s f16-vs-f32 half (e.g.
+`f16_int4_quant` -> `f16`) — the VAE decoder gets no int4/int8 quant here (unquantized,
+decomposed GroupNorm, matching the WebNN bundle's own `vae_decoder_model_f16.onnx`); for
+quantization or `fuse_group_norm=true`, build it standalone with `-m vae_decoder` or call
+`builder.py` directly (see
+[ZIMAGE_VAE_USAGE.md](src/python/py/models/builders/ZIMAGE_VAE_USAGE.md)).
+
+This bundle is fully self-contained — no WebNN bundle needed at all. Point `run_z_image_turbo.py`
+at it directly (see [Running the Full Pipeline](#running-the-full-pipeline-text-to-image)); for
+the default `f16_int4_quant` precision, every filename above already matches the pipeline's
+built-in defaults, so its swap-in flags (`--transformer`, `--text_encoder`, `--vae_decoder`,
+`--scheduler_step`, `--vae_pre_process`, `--sc_prep`) are optional.
+
 ## Precondition on Resolution and Caption Length
 
 Because the exported graph has no padding/masking logic, the caller must ensure:
@@ -159,7 +288,9 @@ It expects a WebNN-exported Z-Image-Turbo model directory (with `tokenizer/`,
 `onnx/text_encoder_model_q4f16.onnx`, and `onnx/vae_decoder_model_f16.onnx`) for the
 tokenizer/text-encoder/VAE baseline. Each of the three models can be swapped for a self-built
 one with `--transformer`, `--text_encoder` and `--vae_decoder` (all are drop-ins — no need to
-copy files over the bundle):
+copy files over the bundle). A fully self-built [`-m all`](#building-everything-at-once) bundle
+is a complete drop-in for this positional argument too, since it has the same `tokenizer/` +
+`onnx/` layout:
 
 ```bash
 cd src/python/py/models
@@ -174,19 +305,35 @@ python run_z_image_turbo.py path_to_webnn_z_image_turbo_dir \
   -n 4 -o output.png
 ```
 
-`--transformer` accounts for this dev exporter's differences from the bundled WebNN
-transformer automatically: 4D `hidden_states` (no `num_frames` axis), no attention
-mask/padding (`encoder_hidden_states` is padded to a multiple of 32 tokens by repeating the
-last real token's embedding), and whichever I/O dtype (`float16`/`float32`) the chosen `-p`
-build used. `--text_encoder` swaps in a `build_z_image_turbo.py -m text_encoder` encoder in
-place of the bundle's `onnx/text_encoder_model_q4f16.onnx`; it's a drop-in (same
-`input_ids`/`attention_mask` inputs, single float16 `encoder_hidden_state` output, auto-detected
-at load). `--vae_decoder` swaps in a `builders/zimage_vae.py` export (same `latent_sample` ->
-`sample` interface as the bundle's `onnx/vae_decoder_model_f16.onnx`; its float16/float32 I/O
-dtype is read from the model). Every flag is optional — omit all to run the WebNN bundle
-end-to-end as a baseline, or pass only one to isolate a single self-built component. See
-`--help` for `--ep` (WebGPU/CPU), `--all_images` (dump every denoising step),
-`-l/--loop` (repeat generation), and `-v` (verbose per-tensor stats) options.
+The pipeline auto-detects each of these three models' shape convention and I/O dtype directly
+from the loaded graph, not from whether the flag was passed — so it works whether a self-built
+model was passed explicitly, or happens to already sit at the bundle's default filename (as in
+an `-m all` bundle). `--transformer` (or a self-built `transformer_model_q4f16.onnx` sitting at
+the default path) is detected as 4D `hidden_states` (no `num_frames` axis, unlike the bundled
+WebNN transformer's 5D) and no attention mask/padding (`encoder_hidden_states` is padded to a
+multiple of 32 tokens by repeating the last real token's embedding). `--text_encoder` swaps in a
+`build_z_image_turbo.py -m text_encoder` encoder in place of the bundle's
+`onnx/text_encoder_model_q4f16.onnx`; it's a drop-in (same `input_ids`/`attention_mask` inputs,
+single float16 `encoder_hidden_state` output, auto-detected at load). `--vae_decoder` swaps in a
+`builders/zimage_vae.py` export (same `latent_sample` -> `sample` interface as the bundle's
+`onnx/vae_decoder_model_f16.onnx`; its float16/float32 I/O dtype is read from the model). Every
+flag is optional — omit all to run the WebNN bundle end-to-end as a baseline, or pass only one to
+isolate a single self-built component. See `--help` for `--ep` (WebGPU/CPU), `--all_images` (dump
+every denoising step), `-l/--loop` (repeat generation), and `-v` (verbose per-tensor stats)
+options.
+
+To match what the WebNN browser demo actually runs, the flow-matching Euler step and the VAE
+pre-scale are executed as the bundle's small helper graphs (`onnx/scheduler_step_model_f16.onnx`
+and `onnx/vae_pre_process_model_f16.onnx`) rather than in numpy. `--safety_checker` additionally
+runs the bundle's `onnx/sc_prep_model_f16.onnx` + `onnx/safety_checker_model_f16.onnx` after
+decoding and prints an NSFW verdict; it loads ~580 MB extra and its runtime is reported
+separately and excluded from the pipeline's total-time metric.
+
+`--scheduler_step`, `--vae_pre_process`, and `--sc_prep` swap in self-built versions of those
+first two helper graphs (see [Building the Helper Models](#building-the-helper-models)) the same
+way `--transformer`/`--text_encoder` do — each is a drop-in; the pipeline auto-detects the
+loaded graph's dtype and shape convention (frame-axis or not) at init time, so any mix of
+bundle/self-built helpers works.
 
 ## Further Reading
 
