@@ -40,7 +40,7 @@ def build_model(config):
         static_options += [
                 "block_size=32",
                 "accuracy_level=4",
-                "op_types_to_quantize=MatMul",
+                "op_types_to_quantize=MatMul/Gather",
                 ]
         # `-p int4` on the WebGPU EP defaults to float16 I/O (matching `f16_int4_quant`);
         # `use_webgpu_fp32` switches it to float32 I/O (`f32_int4_quant`).
