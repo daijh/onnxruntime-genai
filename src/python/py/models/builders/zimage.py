@@ -99,7 +99,16 @@ class ZImageTransformerModel(Model):
         # is a no-op on the eventual normalized output (in exact math, and to well within
         # float16 precision, since `norm_eps` is negligible next to these signals' variance
         # either way) while keeping every intermediate representable in float16.
-        self.pre_out_proj_scale = 1.0 / 1024.0
+        #
+        # All factors are exact powers of two in float16. `attention.to_out` takes the full
+        # 1/128 on its single input. `feed_forward.w2`'s input is the SwiGLU product
+        # `SiLU(w1) * w3`, so the same 1/128 is *split* across the two factors -- 1/8 on the
+        # SiLU gate, 1/16 on w3 (8 * 16 == 128) -- and applied *before* the elementwise
+        # multiply, so neither the product nor the w2 matmul that consumes it can overflow.
+        # This mirrors the validated post-export `apply_scaledown_d_fix_all` strategy.
+        self.pre_out_proj_scale = 1.0 / 128.0
+        self.ff_gate_scale = 1.0 / 8.0
+        self.ff_up_scale = 1.0 / 16.0
 
     # ------------------------------------------------------------------
     # Weight loading
@@ -495,16 +504,20 @@ class ZImageTransformerModel(Model):
     # ------------------------------------------------------------------
     # Attention / FeedForward / transformer block
     # ------------------------------------------------------------------
-    def _rescale_preout(self, name, root_input, shape):
-        """Scale down a `to_out`/`w2` input by `self.pre_out_proj_scale` (see `__init__`).
+    def _rescale_preout(self, name, root_input, shape, scale=None):
+        """Scale down an output-projection input by `scale` (default `self.pre_out_proj_scale`).
 
         Only needed to avoid float16 overflow (see ZIMAGE_DESIGN.md's "float16
         Dynamic-Range Overflow" section); float32 I/O has enough headroom that the raw
-        pre-norm magnitude never overflows, so skip the extra node there.
+        pre-norm magnitude never overflows, so skip the extra node there. `_make_feed_forward`
+        passes the two split factors (1/8, 1/16) to scale the SwiGLU operands *before* their
+        multiply; `_make_attention` uses the default single 1/128 on the `to_out` input.
         """
         if self.io_dtype != ir.DataType.FLOAT16:
             return root_input
-        return self._mul(name, [root_input, self._const(self.io_dtype, self.pre_out_proj_scale)], shape)
+        if scale is None:
+            scale = self.pre_out_proj_scale
+        return self._mul(name, [root_input, self._const(self.io_dtype, scale)], shape)
 
     def _make_attention(self, name, x, num_tokens_shape, cos_cache, sin_cache, position_ids, attn):
         shape3 = [1, num_tokens_shape, self.dim]
@@ -542,8 +555,13 @@ class ZImageTransformerModel(Model):
         gate = self._linear(f"{name}/w1", x, ff.w1, hidden_shape)
         gate = self._silu(f"{name}/w1_silu", gate, hidden_shape)
         up = self._linear(f"{name}/w3", x, ff.w3, hidden_shape)
+        # float16 overflow protection: split the 1/128 pre-`w2` scale across the two SwiGLU
+        # factors (1/8 on the SiLU gate, 1/16 on w3) and apply it *before* the elementwise
+        # multiply, so neither the product nor the w2 matmul that consumes it can overflow.
+        # `ffn_norm2` (RMSNorm) downstream absorbs the 1/128. No-op for float32 I/O.
+        gate = self._rescale_preout(f"{name}/w1_silu/PreScale", gate, hidden_shape, self.ff_gate_scale)
+        up = self._rescale_preout(f"{name}/w3/PreScale", up, hidden_shape, self.ff_up_scale)
         gated = self._mul(f"{name}/Gated", [gate, up], hidden_shape)
-        gated = self._rescale_preout(f"{name}/w2/PreScale", gated, hidden_shape)
         return self._linear(f"{name}/w2", gated, ff.w2, shape3)
 
     def _make_block(self, name, x, num_tokens_shape, cos_cache, sin_cache, position_ids, block, modulation, adaln_input=None):
