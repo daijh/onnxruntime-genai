@@ -1,17 +1,18 @@
 # Z-Image-Turbo ONNX Exporters (onnxruntime-genai dev branch)
 
-This branch of `onnxruntime-genai` adds standalone ONNX exporters for two pieces of the
+This branch of `onnxruntime-genai` adds standalone ONNX exporters for three pieces of the
 [Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) text-to-image pipeline:
 
 - the **diffusion transformer trunk** (diffusers class `ZImageTransformer2DModel`) — a custom
   exporter that consumes pre-computed caption embeddings and a raw image latent and produces a
-  denoised/velocity-predicted latent; and
+  denoised/velocity-predicted latent;
 - the **Qwen3 text encoder** that produces those caption embeddings — built with the stock
-  `builder.py` LLM path and post-processed into a single-forward encoder.
+  `builder.py` LLM path and post-processed into a single-forward encoder; and
+- the **VAE decoder** (diffusers `AutoencoderKL.decoder`) that turns the final latent into an
+  RGB image — see [ZIMAGE_VAE_USAGE.md](src/python/py/models/builders/ZIMAGE_VAE_USAGE.md).
 
-Neither is an onnxruntime-genai runtime integration — both are plain ONNX graphs run directly
-via `onnxruntime.InferenceSession`. A caller drives the diffusion sampling loop, text encoding,
-and VAE decode itself.
+None is an onnxruntime-genai runtime integration — all are plain ONNX graphs run directly
+via `onnxruntime.InferenceSession`. A caller drives the diffusion sampling loop itself.
 
 All of the exporter code lives under `src/python/py/models/`:
 
@@ -19,6 +20,7 @@ All of the exporter code lives under `src/python/py/models/`:
 |---|---|
 | [`src/python/py/models/builders/zimage.py`](src/python/py/models/builders/zimage.py) | `ZImageTransformerModel`, the transformer-trunk exporter itself |
 | [`src/python/py/models/builders/zimage_text_encoder.py`](src/python/py/models/builders/zimage_text_encoder.py) | `strip_to_text_encoder`, post-processes a genai-built Qwen3 decoder into the text encoder |
+| [`src/python/py/models/builders/zimage_vae.py`](src/python/py/models/builders/zimage_vae.py) | `ZImageVAEDecoderModel`, the VAE decoder exporter (see [ZIMAGE_VAE_DESIGN.md](src/python/py/models/builders/ZIMAGE_VAE_DESIGN.md) / [ZIMAGE_VAE_USAGE.md](src/python/py/models/builders/ZIMAGE_VAE_USAGE.md)) |
 | [`src/python/py/models/build_z_image_turbo.py`](src/python/py/models/build_z_image_turbo.py) | CLI wrapper for building the transformer (all precision variants) and the text encoder |
 | [`src/python/py/models/run_z_image_turbo.py`](src/python/py/models/run_z_image_turbo.py) | Standalone end-to-end text-to-image pipeline driver that can run the exported transformer |
 | [`src/python/py/models/builders/ZIMAGE_DESIGN.md`](src/python/py/models/builders/ZIMAGE_DESIGN.md) | Architecture, scope, and design rationale |
@@ -27,7 +29,8 @@ All of the exporter code lives under `src/python/py/models/`:
 
 ## Scope
 
-- **Transformer trunk + Qwen3 text encoder.** No VAE decoder (use the WebNN bundle's own).
+- **Transformer trunk + Qwen3 text encoder + VAE decoder.** Each is built and swapped in
+  independently; the VAE decoder is documented separately in `ZIMAGE_VAE_*.md`.
 - **Standalone ONNX graphs.** No onnxruntime-genai C++ generator runtime integration.
 - **Dynamic height/width**, batch size fixed at 1 (transformer).
 - **No padding/pad-token machinery** in the transformer — resolutions and caption lengths must
@@ -154,10 +157,9 @@ tensors used for verification.
 
 It expects a WebNN-exported Z-Image-Turbo model directory (with `tokenizer/`,
 `onnx/text_encoder_model_q4f16.onnx`, and `onnx/vae_decoder_model_f16.onnx`) for the
-tokenizer/text-encoder/VAE. The VAE decoder is out of scope for this repo, so it's always
-loaded from that bundle. The transformer and text encoder, however, can each be swapped for a
-self-built one with `--transformer` and `--text_encoder` (both are drop-ins — no need to copy
-files over the bundle):
+tokenizer/text-encoder/VAE baseline. Each of the three models can be swapped for a self-built
+one with `--transformer`, `--text_encoder` and `--vae_decoder` (all are drop-ins — no need to
+copy files over the bundle):
 
 ```bash
 cd src/python/py/models
@@ -166,6 +168,7 @@ pip install psutil transformers pillow torch onnxruntime  # in addition to the d
 python run_z_image_turbo.py path_to_webnn_z_image_turbo_dir \
   --transformer path_to_transformer_output_folder/model.onnx \
   --text_encoder path_to_text_encoder_output_folder/text_encoder_model_q4f16.onnx \
+  --vae_decoder path_to_vae_output_folder/model.onnx \
   --prompt "a cat under the snow with blue eyes, cinematic style" \
   --height 512 --width 512 \
   -n 4 -o output.png
@@ -178,9 +181,11 @@ last real token's embedding), and whichever I/O dtype (`float16`/`float32`) the 
 build used. `--text_encoder` swaps in a `build_z_image_turbo.py -m text_encoder` encoder in
 place of the bundle's `onnx/text_encoder_model_q4f16.onnx`; it's a drop-in (same
 `input_ids`/`attention_mask` inputs, single float16 `encoder_hidden_state` output, auto-detected
-at load). Either flag is optional — omit both to run the WebNN bundle end-to-end as a baseline,
-or pass only one to isolate a single self-built component. The VAE decoder is always the
-bundle's. See `--help` for `--ep` (WebGPU/CPU), `--all_images` (dump every denoising step),
+at load). `--vae_decoder` swaps in a `builders/zimage_vae.py` export (same `latent_sample` ->
+`sample` interface as the bundle's `onnx/vae_decoder_model_f16.onnx`; its float16/float32 I/O
+dtype is read from the model). Every flag is optional — omit all to run the WebNN bundle
+end-to-end as a baseline, or pass only one to isolate a single self-built component. See
+`--help` for `--ep` (WebGPU/CPU), `--all_images` (dump every denoising step),
 `-l/--loop` (repeat generation), and `-v` (verbose per-tensor stats) options.
 
 ## Further Reading

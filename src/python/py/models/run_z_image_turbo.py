@@ -361,6 +361,7 @@ class ZImagePipeline:
         all_images: bool = False,
         dev_transformer_path: str = "",
         dev_text_encoder_path: str = "",
+        dev_vae_decoder_path: str = "",
     ):
         print("ZImagePipeline")
         self.path_ = path
@@ -379,7 +380,8 @@ class ZImagePipeline:
         #   - has no internal padding/attention-mask logic, so `encoder_hidden_states`
         #     must be pre-padded to a multiple of 32 tokens by the caller (done in
         #     `run_text_encoder`/`run_transformer` below).
-        # Only the VAE decoder is always left untouched (still the WebNN one).
+        # Each of the three models can be swapped independently; see --text_encoder and
+        # --vae_decoder below.
         self.using_dev_transformer_ = bool(dev_transformer_path)
         if self.using_dev_transformer_:
             self.transformer_model_ = os.path.abspath(dev_transformer_path)
@@ -393,6 +395,14 @@ class ZImagePipeline:
         if self.using_dev_text_encoder_:
             self.text_encoder_model_ = os.path.abspath(dev_text_encoder_path)
             print(f"Using dev text encoder: {self.text_encoder_model_}")
+
+        # --vae_decoder: swap in the onnxruntime-genai-exported VAE decoder (see
+        # builders/zimage_vae.py). Same I/O names/shapes as the bundled WebNN one; its I/O
+        # dtype follows its build precision and is read from the model in
+        # `initialize_vae_decoder`.
+        if dev_vae_decoder_path:
+            self.vae_decoder_model_ = os.path.abspath(dev_vae_decoder_path)
+            print(f"Using dev VAE decoder: {self.vae_decoder_model_}")
 
         #  Get supported providers
         available_providers = ort.get_available_providers()
@@ -775,10 +785,9 @@ class ZImagePipeline:
                 print(f"output: {output}")
 
             # The VAE's `latent_sample` input dtype is independent of `model_dtype_` (which
-            # tracks the text encoder's output dtype). The bundle's text encoder emits float32
-            # and its VAE takes float32, so they coincided; but a self-built `-m text_encoder`
-            # emits float16, which would then be fed into the float32 VAE input. Query the VAE's
-            # own input dtype instead of assuming it matches the text encoder.
+            # tracks the text encoder's output dtype): the bundled WebNN VAE is float32 I/O,
+            # the genai-built `-p fp16` VAE is float16 I/O, and a self-built `-m text_encoder`
+            # emits float16. Query the VAE's own input dtype instead of assuming it matches.
             latent_input = next(i for i in inputs if i.name == "latent_sample")
             if latent_input.type == "tensor(float16)":
                 self.vae_dtype_ = np.float16
@@ -902,7 +911,7 @@ if __name__ == "__main__":
         help=(
             "Path to an onnxruntime-genai-exported z-transformer model.onnx "
             "(build_z_image_turbo.py -m transformer) to use instead of the bundled WebNN "
-            "transformer. VAE decoder is unchanged; see --text_encoder for the text encoder."
+            "transformer. See --text_encoder and --vae_decoder for the other two models."
         ),
     )
     parser.add_argument(
@@ -915,6 +924,17 @@ if __name__ == "__main__":
             "(build_z_image_turbo.py -m text_encoder, e.g. .../text_encoder_model_q4f16.onnx) "
             "to use instead of the bundled WebNN text encoder. It's a drop-in for the bundle's "
             "onnx/text_encoder_model_q4f16.onnx."
+        ),
+    )
+    parser.add_argument(
+        "--vae_decoder",
+        type=str,
+        default="",
+        metavar="PATH",
+        help=(
+            "Path to an onnxruntime-genai-exported VAE decoder model.onnx "
+            "(see onnxruntime-genai's builders/zimage_vae.py) to use instead of the "
+            "bundled WebNN VAE decoder. Its I/O dtype (float16/float32) is read from the model."
         ),
     )
     args = parser.parse_args()
@@ -931,6 +951,7 @@ if __name__ == "__main__":
     print(f"all_images: {args.all_images}")
     print(f"transformer: {args.transformer}")
     print(f"text_encoder: {args.text_encoder}")
+    print(f"vae_decoder: {args.vae_decoder}")
 
     if not os.path.exists(args.model):
         print(f"\n❌ ERROR: Model path not found!")
@@ -947,11 +968,17 @@ if __name__ == "__main__":
         print(f"       The path '{args.text_encoder}' does not exist.")
         sys.exit(1)
 
+    if args.vae_decoder and not os.path.exists(args.vae_decoder):
+        print(f"\n❌ ERROR: --vae_decoder model path not found!")
+        print(f"       The path '{args.vae_decoder}' does not exist.")
+        sys.exit(1)
+
     pipeline = ZImagePipeline(
         args.model, args.ep, args.num_inference_steps,
         args.height, args.width, args.verbose, args.all_images,
         dev_transformer_path=args.transformer,
         dev_text_encoder_path=args.text_encoder,
+        dev_vae_decoder_path=args.vae_decoder,
     )
     pipeline.initialize()
 
