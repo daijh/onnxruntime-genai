@@ -1,0 +1,22 @@
+# Self-contained Z-Image-Turbo exporter experiment.
+#
+# Unlike ../builders/zimage.py (which reaches into this repo's own
+# ../builders/base.py), build_transformer.py depends only on the *public*
+# onnxruntime-genai package for its `Model` base class -- pin below is the
+# latest version on PyPI (also the one this experiment was verified against).
+# Only ships wheels for Python 3.11/3.12/3.13 -- use one of those interpreters.
+onnxruntime-genai==0.15.2
+
+# onnxruntime-genai's `Model` base class imports these itself (int4
+# MatMulNBits quantization lives in `onnxruntime`, a separate package from
+# `onnxruntime-genai`; `transformers`/`tqdm` are imported unconditionally
+# even though this transformer trunk doesn't use HF AutoConfig/AutoTokenizer).
+onnxruntime>=1.20
+transformers>=4.40
+tqdm
+
+onnx
+onnx-ir
+torch
+diffusers
+numpy
