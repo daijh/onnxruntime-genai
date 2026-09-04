@@ -20,3 +20,6 @@ onnx-ir
 torch
 diffusers
 numpy
+
+# build_helper_models.py's f16 conversion pass (no Model/onnxruntime-genai dependency there).
+onnxconverter-common

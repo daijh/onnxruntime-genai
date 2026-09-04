@@ -15,8 +15,8 @@ depends only on the public onnxruntime-genai pip package, not on this repo's own
 -m/--model selects which component to build; each maps to one build_*.py's `build()`:
     transformer    -> build_transformer.py   (implemented)
     vae_decoder    -> build_vae_decoder.py   (implemented)
+    helper_models  -> build_helper_models.py (implemented)
     text_encoder   -> build_text_encoder.py  (not yet ported)
-    helper_models  -> build_helper_models.py (not yet ported)
     safety_checker -> build_safety_checker.py (not yet ported)
     all            -> every component above, in one bundle directory
 """
@@ -24,10 +24,11 @@ depends only on the public onnxruntime-genai pip package, not on this repo's own
 import argparse
 import os
 
+import build_helper_models
 import build_transformer
 import build_vae_decoder
 
-NOT_YET_PORTED = ("text_encoder", "helper_models", "safety_checker")
+NOT_YET_PORTED = ("text_encoder", "safety_checker")
 
 
 def get_args():
@@ -39,7 +40,7 @@ def get_args():
     )
     parser.add_argument(
         "-m", "--model", default="all",
-        choices=["transformer", "vae_decoder", "text_encoder", "helper_models", "safety_checker", "all"],
+        choices=["transformer", "vae_decoder", "helper_models", "text_encoder", "safety_checker", "all"],
         help="Which component to build. Default: all.",
     )
     parser.add_argument(
@@ -64,6 +65,10 @@ def build_one(model, input_path, output_dir, extra_options):
         return build_vae_decoder.build(
             vae_input, output_dir, extra_options=build_vae_decoder.parse_extra_options(extra_options)
         )
+    if model == "helper_models":
+        return build_helper_models.build(
+            input_path, output_dir, extra_options=build_helper_models.parse_extra_options(extra_options)
+        )
     if model in NOT_YET_PORTED:
         raise NotImplementedError(
             f"-m {model} isn't ported to this standalone (pip-onnxruntime-genai-only) experiment yet. "
@@ -76,7 +81,7 @@ def main():
     args = get_args()
     if args.model == "all":
         onnx_dir = args.output_dir
-        for model in ("transformer", "vae_decoder", *NOT_YET_PORTED):
+        for model in ("transformer", "vae_decoder", "helper_models", *NOT_YET_PORTED):
             try:
                 onnx_dir = build_one(model, args.input_path, args.output_dir, args.extra_options)
             except NotImplementedError as e:
