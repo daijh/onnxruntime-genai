@@ -3,157 +3,314 @@
 # Licensed under the MIT License.  See License.txt in the project root for
 # license information.
 # --------------------------------------------------------------------------
-"""Post-process a genai-built Qwen3 decoder into the Z-Image-Turbo text encoder.
+"""Build the Z-Image-Turbo text encoder ONNX graph directly from a Qwen3 HF checkpoint.
 
 The Z-Image-Turbo pipeline drives its DiT transformer with caption features taken
 from a Qwen3 language model. Rather than a full autoregressive decoder, it needs a
-single-forward encoder that maps ``input_ids``/``attention_mask`` to one hidden-state
-tensor. `builder.py` already knows how to build the Qwen3 trunk (int4 weights, fp16 I/O,
-WebGPU); this module performs the graph surgery that turns that decoder into the encoder,
-mirroring the hand-run reference `modify_genai_model.py` but parameterized and emitting a
-float16 output (the runtime auto-detects fp16, so we skip the reference's float32 cast).
+single-forward encoder that maps `input_ids`/`attention_mask` to one hidden-state
+tensor (`encoder_hidden_state`): the residual stream entering the model's last
+decoder layer (equivalently, HuggingFace's `output_hidden_states=True`
+`hidden_states[-2]`).
 
-The surgery:
-  1. Tap the penultimate hidden state -- the SkipLayerNorm residual sum entering the last
-     decoder layer, ``/model/layers.{num_layers-1}/input_layernorm/output_3`` (== HF
-     ``hidden_states[-2]``) -- and re-expose it as the graph output ``encoder_hidden_state``.
-  2. Drop the KV-cache graph inputs (``past_key_values.*``); the WebGPU GQA mask subgraph
-     derives seqlens/total-seq-len from ``attention_mask`` alone, so empty KV is valid.
-  3. Replace all outputs (``logits``/``present.*``) with the single ``encoder_hidden_state``.
-  4. Dead-code-eliminate everything unreachable from the new output (last layer, final
-     norm, LM head) and prune the now-unused initializers.
+This module builds that graph directly with `onnx.helper` -- no dependency on this
+repo's generic model-builder infrastructure. It constructs only `num_hidden_layers - 1`
+decoder layers (the last layer, final norm, and lm_head are never built), using the same
+fused ops the generic builder emits for a WebGPU int4 Qwen3 GroupQueryAttention
+export: `com.microsoft.GroupQueryAttention` with rotary embeddings fused in
+(`do_rotary=1`, matching the generic builder's default for any non-DML EP), and
+Q/K per-head RMSNorm kept as separate ops (not fused into GQA, so GQA stays at its
+<=12-input schema form). GQA derives each token's rotary position internally from
+`seqlens_k`/`total_seq_len` (itself derived from `attention_mask` via a graph-
+capture-style reformatting subgraph) -- no `position_ids` input exists anywhere in
+this graph, external or internal. No KV cache graph inputs are ever emitted;
+GroupQueryAttention gets empty `past_key`/`past_value`.
 """
 
+import json
 import os
 
+import numpy as np
 import onnx
-from onnx import TensorProto, helper
+import torch
+from onnx import TensorProto, helper, numpy_helper
+from onnxruntime.quantization.matmul_nbits_quantizer import MatMulNBitsQuantizer, QuantFormat
+from transformers import AutoModelForCausalLM
 
 
-def strip_to_text_encoder(
-    input_onnx,
-    output_onnx,
-    num_layers,
-    external_data_name,
-    hidden_size=None,
-    output_name="encoder_hidden_state",
-):
-    """Rewrite a genai Qwen3 decoder ONNX into the Z-Image-Turbo text encoder.
+def _read_qwen3_config(text_encoder_dir):
+    with open(os.path.join(text_encoder_dir, "config.json"), encoding="utf-8") as f:
+        cfg = json.load(f)
+    return {
+        "num_layers": cfg["num_hidden_layers"],
+        "hidden_size": cfg["hidden_size"],
+        "num_attn_heads": cfg["num_attention_heads"],
+        "num_kv_heads": cfg["num_key_value_heads"],
+        "head_size": cfg["head_dim"],
+        "rope_theta": float(cfg["rope_theta"]),
+        "rms_norm_eps": float(cfg["rms_norm_eps"]),
+        "max_position_embeddings": cfg["max_position_embeddings"],
+    }
 
-    Args:
-        input_onnx: path to the genai-built ``model.onnx`` (with external data alongside).
-        output_onnx: path to write the encoder ``.onnx`` (external data written next to it).
-        num_layers: number of decoder layers; the penultimate tap is ``layers.{num_layers-1}``.
-        external_data_name: filename for the external-data blob (e.g. ``*.onnx_data``).
-        hidden_size: hidden dim for the declared output shape; ``None`` leaves it unshaped.
-        output_name: name of the single graph output tensor.
+
+def _rotary_cos_sin_tables(head_size, rope_theta, max_position_embeddings):
+    # Standard (non-scaled) Qwen3 RoPE: Z-Image-Turbo's checkpoint has rope_scaling=null.
+    dim = head_size
+    inv_freq = 1.0 / (rope_theta ** (np.arange(0, dim, 2, dtype=np.int64).astype(np.float64) / dim))
+    t = np.arange(max_position_embeddings, dtype=np.float64)
+    freqs = np.outer(t, inv_freq)
+    emb = np.concatenate([freqs, freqs], axis=-1)
+    # com.microsoft.RotaryEmbedding expects cos/sin caches of shape [max_seq_len, head_size/2]
+    cos_cache = np.cos(emb)[:, : dim // 2].astype(np.float16)
+    sin_cache = np.sin(emb)[:, : dim // 2].astype(np.float16)
+    return cos_cache, sin_cache
+
+
+class _GraphBuilder:
+    """Accumulates onnx NodeProtos and initializers for the encoder graph."""
+
+    def __init__(self):
+        self.nodes = []
+        self.initializers = []
+
+    def initializer(self, name, array):
+        self.initializers.append(numpy_helper.from_array(np.ascontiguousarray(array), name=name))
+        return name
+
+    def const_i64(self, name, values):
+        return self.initializer(name, np.array(values, dtype=np.int64))
+
+    def node(self, op_type, inputs, outputs, name, domain="", **attrs):
+        self.nodes.append(helper.make_node(op_type, inputs, outputs, name=name, domain=domain, **attrs))
+        return outputs[0]
+
+
+def _attention_mask_reformat(gb, attention_mask_name):
+    # Mirrors builders/expansions/webgpu.py's WebGPU.make_attention_mask_graph_capture_
+    # reformatting_for_gqa (no Shape op -- everything stays derivable from attention_mask):
+    #   attention_mask -> Cast(int32) -> ReduceSum(axis=1, keepdims=0) -> {Sub 1 -> seqlens_k;
+    #                                                                      ReduceMax -> total_seq_len}
+    mask_i32 = gb.node("Cast", [attention_mask_name], ["attn_mask_reformat/mask_i32"],
+                        "attn_mask_reformat/Cast", to=TensorProto.INT32)
+    axis1 = gb.const_i64("attn_mask_reformat/axis1", [1])
+    mask_sum = gb.node("ReduceSum", [mask_i32, axis1], ["attn_mask_reformat/mask_sum"],
+                        "attn_mask_reformat/ReduceSum", keepdims=0)
+    one_i32 = gb.initializer("attn_mask_reformat/one_i32", np.array([1], dtype=np.int32))
+    seqlens_k = gb.node("Sub", [mask_sum, one_i32], ["attn_mask_reformat/seqlens_k"],
+                         "attn_mask_reformat/Sub")
+    total_seq_len = gb.node("ReduceMax", [mask_sum], ["attn_mask_reformat/total_seq_len"],
+                             "attn_mask_reformat/ReduceMax", keepdims=0)
+    return seqlens_k, total_seq_len
+
+
+def _simplified_layernorm(gb, x, weight_name, eps, name_prefix, skip=None, need_sum=False, sum_output_name=None):
+    # skip=None -> plain SimplifiedLayerNormalization (default "" domain, axis/stash_type attrs).
+    # skip=<name> -> SkipSimplifiedLayerNormalization (com.microsoft domain): computes
+    # sum = x + skip, then Y = norm(sum). need_sum=True also returns the sum (4th output);
+    # the sum feeds the *next* layer's fused input-norm, or -- for the very last node this
+    # module builds -- becomes `encoder_hidden_state` directly (via sum_output_name, so the
+    # graph's final output tensor is produced directly by this node, no extra rename op).
+    inputs = [x, weight_name] if skip is None else [x, skip, weight_name]
+    op_type = ("Skip" if skip is not None else "") + "SimplifiedLayerNormalization"
+    domain = "com.microsoft" if skip is not None else ""
+    y = f"{name_prefix}/Y"
+    sum_name = sum_output_name or f"{name_prefix}/sum"
+    outputs = [y] if skip is None else [y, "", "", (sum_name if need_sum else "")]
+    attrs = {"epsilon": eps}
+    if skip is None:
+        attrs.update(axis=-1, stash_type=1)
+    gb.node(op_type, inputs, outputs, name_prefix, domain=domain, **attrs)
+    return y, (outputs[3] if skip is not None else None)
+
+
+def _qk_head_norm(gb, x, weight_name, num_heads, head_size, eps, name_prefix):
+    # BxSxD -> Bx(S*N)xH -> SimplifiedLayerNormalization -> BxSxD
+    shape1 = gb.const_i64(f"{name_prefix}/shape1", [0, -1, head_size])
+    r1 = gb.node("Reshape", [x, shape1], [f"{name_prefix}/Reshape_1/out"], f"{name_prefix}/Reshape_1")
+    normed, _ = _simplified_layernorm(gb, r1, weight_name, eps, f"{name_prefix}/SimplifiedLayerNormalization")
+    shape2 = gb.const_i64(f"{name_prefix}/shape2", [0, -1, num_heads * head_size])
+    return gb.node("Reshape", [normed, shape2], [f"{name_prefix}/Reshape_2/out"], f"{name_prefix}/Reshape_2")
+
+
+def _matmul(gb, x, weight_param, name_prefix):
+    # weight_param: an HF nn.Linear weight, shape [out_features, in_features]. ONNX MatMul
+    # needs [in_features, out_features], so transpose. Qwen3 has no bias on any projection
+    # (attention_bias=false, and the MLP/output projections don't use bias either).
+    weight = weight_param.detach().to(torch.float16).numpy().T
+    weight_name = gb.initializer(f"{name_prefix}.weight", weight)
+    return gb.node("MatMul", [x, weight_name], [f"{name_prefix}/out"], f"{name_prefix}/MatMul")
+
+
+def _build_decoder_layer(gb, layer_id, layer, root_residual, input_ln_skip, dims,
+                          seqlens_k_name, total_seq_len_name, cos_cache_name, sin_cache_name):
+    """Emits one full Qwen3 decoder layer (attention + MLP).
+
+    root_residual: the residual stream entering this layer's input_layernorm (== the
+        embeddings output for layer 0, or the previous layer's `resid_before_mlp` otherwise).
+    input_ln_skip: None for layer 0 (plain SimplifiedLayerNormalization); otherwise the
+        previous layer's MLP output, fused into this layer's input_layernorm as a
+        SkipSimplifiedLayerNormalization (this is the "residual add from the previous layer,
+        fused into this layer's norm" pattern the generic builder also uses).
+
+    Returns (resid_before_mlp, mlp_output) -- both needed to build the next layer, and (for
+    the last layer this module builds) resid_before_mlp/mlp_output together are what the
+    caller feeds into one more `_simplified_layernorm(..., skip=mlp_output, need_sum=True)`
+    call (using the *next* layer's input_layernorm weight) to produce `encoder_hidden_state`.
     """
-    tap_name = f"/model/layers.{num_layers - 1}/input_layernorm/output_3"
+    num_attn_heads, num_kv_heads = dims["num_attn_heads"], dims["num_kv_heads"]
+    head_size, eps = dims["head_size"], dims["rms_norm_eps"]
 
-    print(f"Loading genai model: {input_onnx}")
-    model = onnx.load(input_onnx)
-    graph = model.graph
-    print(f"  original nodes={len(graph.node)} initializers={len(graph.initializer)}")
+    ln1_w = gb.initializer(
+        f"model.layers.{layer_id}.input_layernorm.weight",
+        layer.input_layernorm.weight.detach().to(torch.float16).numpy(),
+    )
+    normed, resid_before_attn = _simplified_layernorm(
+        gb, root_residual, ln1_w, eps, f"layer{layer_id}/input_layernorm",
+        skip=input_ln_skip, need_sum=(input_ln_skip is not None),
+    )
+    if input_ln_skip is None:
+        resid_before_attn = root_residual
 
-    # 1. Re-expose the penultimate residual as `encoder_hidden_state` (fp16).
-    #    Rename the producing node's output slot in place -- no extra op. Downstream
-    #    consumers of the old name become unreachable and are removed by DCE below.
-    producer = None
-    for node in graph.node:
-        for i, out in enumerate(node.output):
-            if out == tap_name:
-                node.output[i] = output_name
-                producer = node
-                break
-        if producer is not None:
-            break
-    if producer is None:
-        raise RuntimeError(
-            f"Tap tensor {tap_name!r} not found in {input_onnx}. The genai builder may have "
-            f"changed its layernorm output naming; update the tap in strip_to_text_encoder()."
-        )
-    print(f"  tapped {tap_name} -> {output_name} (produced by {producer.name!r})")
+    attn = layer.self_attn
+    q = _matmul(gb, normed, attn.q_proj.weight, f"layer{layer_id}/attn/q_proj")
+    k = _matmul(gb, normed, attn.k_proj.weight, f"layer{layer_id}/attn/k_proj")
+    v = _matmul(gb, normed, attn.v_proj.weight, f"layer{layer_id}/attn/v_proj")
 
-    # Keep any matching value_info annotation consistent with the renamed tensor.
-    for value_info in graph.value_info:
-        if value_info.name == tap_name:
-            value_info.name = output_name
+    qn_w = gb.initializer(f"model.layers.{layer_id}.attn.q_norm.weight",
+                           attn.q_norm.weight.detach().to(torch.float16).numpy())
+    kn_w = gb.initializer(f"model.layers.{layer_id}.attn.k_norm.weight",
+                           attn.k_norm.weight.detach().to(torch.float16).numpy())
+    q = _qk_head_norm(gb, q, qn_w, num_attn_heads, head_size, eps, f"layer{layer_id}/attn/q_norm")
+    k = _qk_head_norm(gb, k, kn_w, num_kv_heads, head_size, eps, f"layer{layer_id}/attn/k_norm")
 
-    # 2. Drop KV-cache inputs; blank out node references so kept attention ops run with
-    #    empty past (valid for a full-sequence forward on the WebGPU GQA path).
-    kv_names = {inp.name for inp in graph.input if inp.name.startswith("past_key_values")}
-    kept_inputs = [inp for inp in graph.input if inp.name not in kv_names]
-    del graph.input[:]
-    graph.input.extend(kept_inputs)
-    for node in graph.node:
-        for i, inp in enumerate(node.input):
-            if inp in kv_names:
-                node.input[i] = ""
-    print(f"  removed {len(kv_names)} past_key_values inputs; kept {[i.name for i in graph.input]}")
+    # RotaryEmbedding is fused into GroupQueryAttention (do_rotary=1) rather than emitted as
+    # separate nodes -- matching the generic builder's default for any non-DML EP
+    # (base.py's is_fused_rope_supported() returns True for webgpu). GQA derives each token's
+    # rotary position internally from seqlens_k/total_seq_len -- its position_ids input is
+    # always left empty, fused or not.
+    scale = float(1.0 / np.sqrt(head_size))
+    attn_out = gb.node(
+        "GroupQueryAttention",
+        [q, k, v, "", "", seqlens_k_name, total_seq_len_name, cos_cache_name, sin_cache_name, "", "", ""],
+        [f"layer{layer_id}/attn/gqa_out", f"layer{layer_id}/attn/present_k", f"layer{layer_id}/attn/present_v"],
+        f"layer{layer_id}/attn/GQA", domain="com.microsoft",
+        num_heads=num_attn_heads, kv_num_heads=num_kv_heads, scale=scale,
+        local_window_size=-1, do_rotary=1, rotary_interleaved=0,
+    )
+    o = _matmul(gb, attn_out, attn.o_proj.weight, f"layer{layer_id}/attn/o_proj")
 
-    # 3. Replace all outputs with the single encoder output.
-    del graph.output[:]
-    output_shape = ["batch_size", "sequence_length", hidden_size] if hidden_size else None
-    graph.output.append(helper.make_tensor_value_info(output_name, TensorProto.FLOAT16, output_shape))
-
-    # 4. Dead-code elimination: keep only what is reachable (backward) from the output.
-    output_to_node = {}
-    for idx, node in enumerate(graph.node):
-        for out in node.output:
-            if out:
-                output_to_node[out] = idx
-
-    keep_indices = set()
-    needed = set()  # tensors that must survive (for pruning initializers)
-    visited = set()
-    queue = [out.name for out in graph.output]
-    while queue:
-        tensor = queue.pop()
-        if tensor in visited:
-            continue
-        visited.add(tensor)
-        needed.add(tensor)
-        producer_idx = output_to_node.get(tensor)
-        if producer_idx is not None:
-            keep_indices.add(producer_idx)
-            for inp in graph.node[producer_idx].input:
-                if inp and inp not in visited:
-                    queue.append(inp)
-
-    kept_nodes = [graph.node[i] for i in sorted(keep_indices)]
-    del graph.node[:]
-    graph.node.extend(kept_nodes)
-
-    kept_initializers = [init for init in graph.initializer if init.name in needed]
-    del graph.initializer[:]
-    graph.initializer.extend(kept_initializers)
-    print(f"  optimized nodes={len(graph.node)} initializers={len(graph.initializer)}")
-
-    # 5. Save with external data (drop any pre-existing blob so we don't leave a stale file).
-    os.makedirs(os.path.dirname(os.path.abspath(output_onnx)), exist_ok=True)
-    external_data_path = os.path.join(os.path.dirname(os.path.abspath(output_onnx)), external_data_name)
-    if os.path.exists(external_data_path):
-        os.remove(external_data_path)
-    onnx.save_model(
-        model,
-        output_onnx,
-        save_as_external_data=True,
-        all_tensors_to_one_file=True,
-        location=external_data_name,
-        size_threshold=1024 * 1024 * 10,
-        convert_attribute=False,
+    post_ln_w = gb.initializer(
+        f"model.layers.{layer_id}.post_attention_layernorm.weight",
+        layer.post_attention_layernorm.weight.detach().to(torch.float16).numpy(),
+    )
+    mlp_in, resid_before_mlp = _simplified_layernorm(
+        gb, resid_before_attn, post_ln_w, eps, f"layer{layer_id}/post_attention_layernorm",
+        skip=o, need_sum=True,
     )
 
-    print(f"  inputs : {[i.name for i in graph.input]}")
-    print(f"  output : {output_name} (float16)")
-    print(f"Saved text encoder: {output_onnx}")
+    mlp = layer.mlp
+    gate = _matmul(gb, mlp_in, mlp.gate_proj.weight, f"layer{layer_id}/mlp/gate_proj")
+    up = _matmul(gb, mlp_in, mlp.up_proj.weight, f"layer{layer_id}/mlp/up_proj")
+    sig = gb.node("Sigmoid", [gate], [f"layer{layer_id}/mlp/sigmoid"], f"layer{layer_id}/mlp/Sigmoid")
+    silu = gb.node("Mul", [gate, sig], [f"layer{layer_id}/mlp/silu"], f"layer{layer_id}/mlp/Mul_silu")
+    gated = gb.node("Mul", [silu, up], [f"layer{layer_id}/mlp/gated"], f"layer{layer_id}/mlp/Mul_gated")
+    down = _matmul(gb, gated, mlp.down_proj.weight, f"layer{layer_id}/mlp/down_proj")
 
-    # Best-effort validation. Pass the path so the checker streams external data instead of
-    # serializing the (multi-GB) in-memory proto, which would trip the 2GB protobuf limit.
-    try:
-        onnx.checker.check_model(output_onnx)
-        print("  onnx.checker: passed")
-    except Exception as exc:  # noqa: BLE001 - validation is advisory; the model is already written
-        print(f"  onnx.checker: WARNING - {exc}")
+    return resid_before_mlp, down
 
-    return output_onnx
+
+def _quantize_int4(onnx_model):
+    """Quantize the encoder graph to int4 using MatMulNBitsQuantizer.
+
+    Applies int4 weight-only quantization to MatMul and Gather ops:
+    - MatMul -> MatMulNBits
+    - Gather (embedding) -> GatherBlockQuantized
+    """
+    quantizer = MatMulNBitsQuantizer(
+        model=onnx_model,
+        bits=4,
+        block_size=32,
+        is_symmetric=True,
+        accuracy_level=4,
+        quant_format=QuantFormat.QOperator,
+        op_types_to_quantize=("MatMul", "Gather"),
+    )
+    quantizer.process()
+    quantized = quantizer.model.model
+    # MatMulNBitsQuantizer updates opset to 21 for int4 support, which requires IR version >= 10
+    quantized.ir_version = 10
+    return quantized
+
+
+def _build_encoder_graph(checkpoint_dir):
+    dims = _read_qwen3_config(checkpoint_dir)
+    num_layers = dims["num_layers"]
+
+    model = AutoModelForCausalLM.from_pretrained(checkpoint_dir, torch_dtype=torch.float16, low_cpu_mem_usage=True)
+    model.eval()
+    layers = model.model.layers
+
+    gb = _GraphBuilder()
+    input_ids_name, attn_mask_name = "input_ids", "attention_mask"
+
+    cos_cache, sin_cache = _rotary_cos_sin_tables(dims["head_size"], dims["rope_theta"], dims["max_position_embeddings"])
+    cos_cache_name = gb.initializer("cos_cache", cos_cache)
+    sin_cache_name = gb.initializer("sin_cache", sin_cache)
+
+    embed_w = gb.initializer("model.embed_tokens.weight",
+                              model.model.embed_tokens.weight.detach().to(torch.float16).numpy())
+    embeddings = gb.node("Gather", [embed_w, input_ids_name], ["embeddings"], "embed/Gather", axis=0)
+
+    seqlens_k_name, total_seq_len_name = _attention_mask_reformat(gb, attn_mask_name)
+
+    root_residual, input_ln_skip = embeddings, None
+    for layer_id in range(num_layers - 1):
+        resid_before_mlp, mlp_out = _build_decoder_layer(
+            gb, layer_id, layers[layer_id], root_residual, input_ln_skip, dims,
+            seqlens_k_name, total_seq_len_name, cos_cache_name, sin_cache_name,
+        )
+        root_residual, input_ln_skip = resid_before_mlp, mlp_out
+
+    # Tap the last layer's input_layernorm: only its residual-sum (4th) output is needed --
+    # the normalized-for-attention output (Y) is computed but left unconsumed, since we never
+    # run that layer's attention. Requires only that one layer's input_layernorm.weight.
+    tap_id = num_layers - 1
+    tap_ln_w = gb.initializer(
+        f"model.layers.{tap_id}.input_layernorm.weight",
+        layers[tap_id].input_layernorm.weight.detach().to(torch.float16).numpy(),
+    )
+    _, encoder_hidden_state = _simplified_layernorm(
+        gb, root_residual, tap_ln_w, dims["rms_norm_eps"], f"layer{tap_id}/input_layernorm",
+        skip=input_ln_skip, need_sum=True, sum_output_name="encoder_hidden_state",
+    )
+    assert encoder_hidden_state is not None  # guaranteed by need_sum=True with a non-None skip
+
+    graph_inputs = [
+        helper.make_tensor_value_info(input_ids_name, TensorProto.INT64, ["batch_size", "sequence_length"]),
+        helper.make_tensor_value_info(attn_mask_name, TensorProto.INT64, ["batch_size", "total_sequence_length"]),
+    ]
+    graph_output = helper.make_tensor_value_info(
+        encoder_hidden_state, TensorProto.FLOAT16, ["batch_size", "sequence_length", dims["hidden_size"]]
+    )
+    graph = helper.make_graph(gb.nodes, "zimage_text_encoder", graph_inputs, [graph_output], initializer=gb.initializers)
+    onnx_model = helper.make_model(
+        graph, opset_imports=[helper.make_opsetid("", 17), helper.make_opsetid("com.microsoft", 1)]
+    )
+    onnx_model.ir_version = 9
+    return onnx_model
+
+
+def export_qwen3_text_encoder(checkpoint_dir, output_onnx_path, external_data_name, quantize):
+    onnx_model = _build_encoder_graph(checkpoint_dir)
+    if quantize:
+        onnx_model = _quantize_int4(onnx_model)
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_onnx_path)) or ".", exist_ok=True)
+    data_path = os.path.join(os.path.dirname(os.path.abspath(output_onnx_path)), external_data_name)
+    if os.path.exists(data_path):
+        os.remove(data_path)
+    onnx.save_model(
+        onnx_model, output_onnx_path, save_as_external_data=True, all_tensors_to_one_file=True,
+        location=external_data_name, size_threshold=1024 * 1024, convert_attribute=False,
+    )
+    print(f"Saved text encoder: {output_onnx_path}")
+    return output_onnx_path

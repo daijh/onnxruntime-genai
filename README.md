@@ -6,8 +6,8 @@ This branch of `onnxruntime-genai` adds standalone ONNX exporters for three piec
 - the **diffusion transformer trunk** (diffusers class `ZImageTransformer2DModel`) — a custom
   exporter that consumes pre-computed caption embeddings and a raw image latent and produces a
   denoised/velocity-predicted latent;
-- the **Qwen3 text encoder** that produces those caption embeddings — built with the stock
-  `builder.py` LLM path and post-processed into a single-forward encoder; and
+- the **Qwen3 text encoder** that produces those caption embeddings — a custom exporter that
+  builds a single-forward encoder graph directly from the Qwen3 checkpoint; and
 - the **VAE decoder** (diffusers `AutoencoderKL.decoder`) that turns the final latent into an
   RGB image — see [ZIMAGE_VAE_USAGE.md](src/python/py/models/builders/ZIMAGE_VAE_USAGE.md).
 
@@ -19,7 +19,7 @@ All of the exporter code lives under `src/python/py/models/`:
 | File | Contents |
 |---|---|
 | [`src/python/py/models/builders/zimage.py`](src/python/py/models/builders/zimage.py) | `ZImageTransformerModel`, the transformer-trunk exporter itself |
-| [`src/python/py/models/builders/zimage_text_encoder.py`](src/python/py/models/builders/zimage_text_encoder.py) | `strip_to_text_encoder`, post-processes a genai-built Qwen3 decoder into the text encoder |
+| [`src/python/py/models/builders/zimage_text_encoder.py`](src/python/py/models/builders/zimage_text_encoder.py) | `export_qwen3_text_encoder`, builds the Qwen3 single-forward text encoder directly from the HF checkpoint |
 | [`src/python/py/models/builders/zimage_vae.py`](src/python/py/models/builders/zimage_vae.py) | `ZImageVAEDecoderModel`, the VAE decoder exporter (see [ZIMAGE_VAE_DESIGN.md](src/python/py/models/builders/ZIMAGE_VAE_DESIGN.md) / [ZIMAGE_VAE_USAGE.md](src/python/py/models/builders/ZIMAGE_VAE_USAGE.md)) |
 | [`src/python/py/models/build_z_image_turbo.py`](src/python/py/models/build_z_image_turbo.py) | CLI wrapper for building the transformer, text encoder, helper models, safety checker, VAE decoder, or all of them at once |
 | [`src/python/py/models/builders/zimage_helper_models.py`](src/python/py/models/builders/zimage_helper_models.py) | `build_helper_models`, builds the scheduler_step/vae_pre_process/sc_prep helper graphs, shaped for the self-built transformer |
@@ -97,32 +97,35 @@ The caption embeddings the transformer consumes come from Z-Image-Turbo's Qwen3 
 Build it with the same wrapper, `-m text_encoder`:
 
 ```bash
-python build_z_image_turbo.py path_to_local_folder -m text_encoder
+python build_z_image_turbo.py path_to_local_folder -m text_encoder -p <precision>
 ```
 
-This is a two-stage build: `builder.py` exports the Qwen3 decoder (int4 weights, float16 I/O,
-`MatMul`+`Gather` quantized), then `strip_to_text_encoder` in
-[`builders/zimage_text_encoder.py`](src/python/py/models/builders/zimage_text_encoder.py)
-rewrites that decoder into a single-forward encoder:
+Unlike the transformer, this doesn't shell out to `builder.py` at all: `export_qwen3_text_encoder`
+in [`builders/zimage_text_encoder.py`](src/python/py/models/builders/zimage_text_encoder.py)
+constructs the encoder graph directly from the Qwen3 checkpoint (`config.json` + safetensors
+weights only — it never touches the tokenizer) with `onnx.helper`, building only the first
+`num_hidden_layers - 1` decoder layers plus one extra layer's input norm (the final layer, final
+norm, and LM head are never built at all, not built-then-stripped):
 
-- taps the penultimate hidden state (`hidden_states[-2]`) as the output,
-- exposes it as a float16 `encoder_hidden_state` of shape `[1, seq, 2560]`,
-- drops the KV-cache inputs (leaving just `input_ids` and `attention_mask`), and
-- dead-code-eliminates the unused final layer, final norm, and LM head.
+- taps the residual stream entering the last decoder layer's input norm (equivalent to
+  HuggingFace's `hidden_states[-2]`) as the output,
+- exposes it as a float16 `encoder_hidden_state` of shape `[1, seq, 2560]`, and
+- takes only `input_ids` and `attention_mask` as graph inputs — `position_ids` is computed
+  internally from `input_ids`, and there's no KV cache (a graph-capture-style mask-reformatting
+  subgraph derives `seqlens_k`/`total_seq_len` from `attention_mask` for `GroupQueryAttention`).
 
-Output goes to
-`<model_name>-text_encoder-genai-wgpu-f16_int4_quant/text_encoder_model_q4f16.onnx` (+
-`.onnx_data`), a drop-in for the WebNN bundle's `onnx/text_encoder_model_q4f16.onnx`. Precision
-is fixed to q4f16 (float16 output); `-p` is ignored for `-m text_encoder`.
+`-p` selects the precision: `f16` (unquantized float16 weights and I/O) or `f16_int4_quant`
+(int4-quantized `MatMul`/`Gather` weights via `MatMulNBitsQuantizer`, float16 I/O). `f32` and
+`f32_int4_quant` aren't supported (`GroupQueryAttention` under fp32 has never been verified for
+this Qwen3 config) and fail fast with an error instead of silently building something else.
 
-> The build passes `fuse_qk_norm_gqa=false` so Qwen3's QK-norm stays as separate
-> `SimplifiedLayerNormalization` ops and `GroupQueryAttention` keeps ≤12 inputs (rotary stays
-> fused inside GQA). The builder's default *fused* form emits a 16-input GQA that current
-> onnxruntime-web / onnxruntime 1.24 reject at load.
+Output goes to `<model_name>-text_encoder-genai-wgpu-<precision>/text_encoder_model_<suffix>.onnx`
+(+ `.onnx_data`), where `<suffix>` is `f16` or `q4f16` matching `-p`. The `q4f16` variant is a
+drop-in for the WebNN bundle's `onnx/text_encoder_model_q4f16.onnx`.
 
-`builder.py` loads the tokenizer from the weights folder, so the wrapper stages the
-`text_encoder/` weights together with the sibling `tokenizer/` files (hardlinked, not copied)
-before building, then removes the staging directory afterward.
+> Q/K per-head RMSNorm stays as separate `SimplifiedLayerNormalization` ops rather than fused
+> into `GroupQueryAttention`, so GQA keeps ≤12 inputs (rotary stays fused inside GQA). A fused
+> form would emit a 16-input GQA that current onnxruntime-web / onnxruntime 1.24 reject at load.
 
 ## Building the Helper Models
 
@@ -203,7 +206,10 @@ self-contained file (weights inline, no `.onnx.data`), a drop-in for the WebNN b
 ## Building Everything at Once
 
 `-m all` builds the transformer, text encoder, helper models, safety checker, and VAE decoder in
-one command, into a single bundle-shaped directory (`--safety_checker_checkpoint` is required):
+one command, into a single bundle-shaped directory (`--safety_checker_checkpoint` is required).
+Since the text encoder only supports `f16`/`f16_int4_quant` (see
+[Building the Text Encoder](#building-the-text-encoder)), `-m all` fails fast with an error for
+`-p f32`/`f32_int4_quant` before building anything, rather than building a partial bundle:
 
 ```bash
 python build_z_image_turbo.py path_to_local_folder -m all -p f16_int4_quant \
@@ -215,25 +221,25 @@ Output goes to `<model_name>-genai-wgpu-<precision>/`, laid out like the WebNN b
 ```
 <model_name>-genai-wgpu-<precision>/
   onnx/
-    transformer_model_<f16|f32|q4f16|q4f32>.onnx(.data)
-    text_encoder_model_q4f16.onnx(_data)
-    scheduler_step_model_<f16|f32>.onnx
-    vae_pre_process_model_<f16|f32>.onnx
-    sc_prep_model_<f16|f32>.onnx
-    safety_checker_model_<f16|f32>.onnx
-    vae_decoder_model_<f16|f32>.onnx
+    transformer_model_<f16|q4f16>.onnx(.data)
+    text_encoder_model_<f16|q4f16>.onnx(_data)
+    scheduler_step_model_<f16>.onnx
+    vae_pre_process_model_<f16>.onnx
+    sc_prep_model_<f16>.onnx
+    safety_checker_model_<f16>.onnx
+    vae_decoder_model_<f16>.onnx
   tokenizer/
     ...
 ```
 
-The transformer filename suffix matches `-p` exactly (`f16`/`f32`/`f16_int4_quant`->`q4f16`/
-`f32_int4_quant`->`q4f32`, mirroring the WebNN bundle's own `transformer_model_q4f16.onnx`
-convention). Everything else's precision is derived from `-p`'s f16-vs-f32 half (e.g.
-`f16_int4_quant` -> `f16`) — the VAE decoder gets no int4/int8 quant here (unquantized,
-decomposed GroupNorm, matching the WebNN bundle's own `vae_decoder_model_f16.onnx`); for
-quantization or `fuse_group_norm=true`, build it standalone with `-m vae_decoder` or call
-`builder.py` directly (see
-[ZIMAGE_VAE_USAGE.md](src/python/py/models/builders/ZIMAGE_VAE_USAGE.md)).
+The transformer and text encoder filename suffixes both match `-p` exactly (`f16`->`f16`/
+`f16_int4_quant`->`q4f16`, mirroring the WebNN bundle's own `transformer_model_q4f16.onnx`/
+`text_encoder_model_q4f16.onnx` convention). Everything else's precision is derived from `-p`'s
+f16-vs-f32 half, which for `-m all` is always `f16` since only `f16`/`f16_int4_quant` are
+accepted — the VAE decoder gets no int4/int8 quant here (unquantized, decomposed GroupNorm,
+matching the WebNN bundle's own `vae_decoder_model_f16.onnx`); for quantization or
+`fuse_group_norm=true`, build it standalone with `-m vae_decoder` or call `builder.py` directly
+(see [ZIMAGE_VAE_USAGE.md](src/python/py/models/builders/ZIMAGE_VAE_USAGE.md)).
 
 This bundle is fully self-contained — no WebNN bundle needed at all. Point `run_z_image_turbo.py`
 at it directly (see [Running the Full Pipeline](#running-the-full-pipeline-text-to-image)); for

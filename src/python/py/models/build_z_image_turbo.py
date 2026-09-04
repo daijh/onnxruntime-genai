@@ -7,7 +7,7 @@ import argparse
 
 import onnx
 
-from builders.zimage_text_encoder import strip_to_text_encoder
+from builders.zimage_text_encoder import export_qwen3_text_encoder
 from builders.zimage_helper_models import build_helper_models
 from builders.zimage_safety_checker import build_safety_checker
 
@@ -107,85 +107,36 @@ def _link_or_copy(src, dst):
         shutil.copy2(src, dst)
 
 
-def _stage_text_encoder_input(text_encoder_dir, tokenizer_dir, stage_dir):
-    # `builder.py` loads the tokenizer from the same folder as the weights, so assemble a
-    # staging folder = text_encoder weights (hardlinked, ~8 GB) + tokenizer files (copied).
-    os.makedirs(stage_dir, exist_ok=True)
-    for fname in os.listdir(text_encoder_dir):
-        src = os.path.join(text_encoder_dir, fname)
-        if os.path.isfile(src):
-            _link_or_copy(src, os.path.join(stage_dir, fname))
-
-    _copy_tokenizer_files(tokenizer_dir, stage_dir)
+# Text encoder filename suffix per precision -- f32/f32_int4_quant aren't supported yet
+# (GroupQueryAttention under fp32 has never been verified for this Qwen3 config).
+TEXT_ENCODER_PRECISIONS = {
+    "f16": "f16",
+    "f16_int4_quant": "q4f16",
+}
 
 
-def build_text_encoder(input_path, output_dir):
-    # The Z-Image-Turbo text encoder is a standard Qwen3 decoder; `builder.py` builds the
-    # int4/fp16 WebGPU trunk, then `strip_to_text_encoder` turns it into a single-forward
-    # encoder (penultimate hidden state -> fp16 `encoder_hidden_state`, KV cache removed).
+def build_text_encoder(input_path, output_dir, precision):
+    if precision not in TEXT_ENCODER_PRECISIONS:
+        print(
+            f"\n❌ ERROR: -m text_encoder / -m all does not support -p {precision}. "
+            f"The text encoder builder only supports {sorted(TEXT_ENCODER_PRECISIONS)} "
+            "(GroupQueryAttention under fp32 has not been verified for this Qwen3 config).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     text_encoder_dir = resolve_component_dir(input_path, "text_encoder")
-    config_path = os.path.join(text_encoder_dir, "config.json")
-    if not os.path.isfile(config_path):
+    if not os.path.isfile(os.path.join(text_encoder_dir, "config.json")):
         print(f"Could not find text_encoder/config.json under {input_path}", file=sys.stderr)
         return
 
-    # The tokenizer lives beside the text_encoder folder (repo_root/tokenizer).
-    tokenizer_dir = resolve_tokenizer_dir(input_path)
-
-    with open(config_path, encoding="utf-8") as f:
-        cfg = json.load(f)
-    num_layers = cfg["num_hidden_layers"]
-    hidden_size = cfg["hidden_size"]
-
-    stage_root = os.path.join(output_dir, "_staging")
-    stage_in = os.path.join(stage_root, "input")
-    stage_out = os.path.join(stage_root, "genai")
-    if os.path.isdir(stage_root):
-        shutil.rmtree(stage_root, ignore_errors=True)
-
-    print(f"Staging text encoder input (weights + tokenizer) at {stage_in}")
-    _stage_text_encoder_input(text_encoder_dir, tokenizer_dir, stage_in)
-
-    # int4 weights (MatMul + Gather so the 152k x 2560 embedding is quantized), fp16 I/O,
-    # WebGPU graph-capture (derives seqlens/total-seq-len from attention_mask, not KV cache).
-    # `fuse_qk_norm_gqa=false` keeps Qwen3's QK-norm as separate SimplifiedLayerNorm ops and
-    # emits a <=12-input GroupQueryAttention. The fused form (builder default) produces a
-    # 16-input GQA that the deploy runtime (onnxruntime-web / onnxruntime 1.24 GQA schema,
-    # max 12 inputs) rejects at load; this matches the reference text-encoder model.
-    command = [
-        "python", "builder.py",
-        "-e", "webgpu",
-        "-p", "int4",
-        "--extra_options",
-        "hf_remote=False",
-        "block_size=32",
-        "accuracy_level=4",
-        "op_types_to_quantize=MatMul/Gather",
-        "enable_webgpu_graph=true",
-        "fuse_qk_norm_gqa=false",
-        "-c", "tmp",
-        "-i", stage_in,
-        "-o", stage_out,
-    ]
-    print("\n" + " ".join(command))
-    try:
-        subprocess.run(command, check=True)
-    except subprocess.CalledProcessError:
-        print("\n######\nFail (builder.py)", file=sys.stderr)
-        return
-
+    suffix = TEXT_ENCODER_PRECISIONS[precision]
     os.makedirs(output_dir, exist_ok=True)
-    final_onnx = os.path.join(output_dir, "text_encoder_model_q4f16.onnx")
-    strip_to_text_encoder(
-        input_onnx=os.path.join(stage_out, "model.onnx"),
-        output_onnx=final_onnx,
-        num_layers=num_layers,
-        external_data_name="text_encoder_model_q4f16.onnx_data",
-        hidden_size=hidden_size,
+    output_onnx = os.path.join(output_dir, f"text_encoder_model_{suffix}.onnx")
+    export_qwen3_text_encoder(
+        text_encoder_dir, output_onnx, f"text_encoder_model_{suffix}.onnx.data",
+        quantize=(precision == "f16_int4_quant"),
     )
-
-    # Drop the ~2.4 GB genai staging artifacts now that the encoder is written.
-    shutil.rmtree(stage_root, ignore_errors=True)
     print("\n######\nSuccess")
 
 
@@ -296,6 +247,15 @@ def build_all(args):
         )
         sys.exit(1)
 
+    if args.precision not in TEXT_ENCODER_PRECISIONS:
+        print(
+            f"\n❌ ERROR: -m all does not support -p {args.precision} yet -- the text encoder "
+            f"builder only supports {sorted(TEXT_ENCODER_PRECISIONS)} (GroupQueryAttention under "
+            "fp32 has not been verified for this Qwen3 config). Use -p f16 or f16_int4_quant.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     model_name = os.path.basename(os.path.normpath(args.input))
     bundle_dir = f"{model_name}-genai-wgpu-{args.precision}"
     onnx_dir = os.path.join(bundle_dir, "onnx")
@@ -313,7 +273,7 @@ def build_all(args):
     )
 
     print("\n### [2/5] text_encoder ###")
-    build_text_encoder(args.input, onnx_dir)
+    build_text_encoder(args.input, onnx_dir, args.precision)
 
     print("\n### [3/5] helper_models ###")
     helper_precision = helper_precision_from(args.precision)
@@ -328,10 +288,11 @@ def build_all(args):
     print("\n### tokenizer ###")
     _copy_tokenizer_files(resolve_tokenizer_dir(args.input), os.path.join(bundle_dir, "tokenizer"))
 
+    text_encoder_suffix = TEXT_ENCODER_PRECISIONS[args.precision]
     run_cmd = (
         f"  python run_z_image_turbo.py {bundle_dir} "
         f"--transformer {bundle_dir}/onnx/{transformer_filename} "
-        f"--text_encoder {bundle_dir}/onnx/text_encoder_model_q4f16.onnx "
+        f"--text_encoder {bundle_dir}/onnx/text_encoder_model_{text_encoder_suffix}.onnx "
         f"--vae_decoder {bundle_dir}/onnx/vae_decoder_model_{helper_precision}.onnx "
         f"--scheduler_step {bundle_dir}/onnx/scheduler_step_model_{helper_precision}.onnx "
         f"--vae_pre_process {bundle_dir}/onnx/vae_pre_process_model_{helper_precision}.onnx "
@@ -387,9 +348,9 @@ if __name__ == "__main__":
         help=(
             "Precision to build: f16/f32 (unquantized WebGPU I/O dtype) or "
             "f16_int4_quant/f32_int4_quant (int4-quantized weights with float16/float32 "
-            "WebGPU I/O). Default: f16_int4_quant. Ignored for -m text_encoder (always q4f16); "
-            "for -m helper_models/safety_checker/vae_decoder/all, only the f16-vs-f32 half "
-            "applies (no int4 quantization)."
+            "WebGPU I/O). Default: f16_int4_quant. For -m helper_models/safety_checker/"
+            "vae_decoder, only the f16-vs-f32 half applies (no int4 quantization). "
+            "-m text_encoder/all support only f16 and f16_int4_quant."
         ),
     )
     args = parser.parse_args()
@@ -399,10 +360,8 @@ if __name__ == "__main__":
     if args.model == "all":
         build_all(args)
     elif args.model == "text_encoder":
-        if args.precision != "f16_int4_quant":
-            print("Note: -m text_encoder always builds q4f16 (fp16 I/O); ignoring -p.")
-        output = f"{model_name}-text_encoder-genai-wgpu-f16_int4_quant"
-        build_text_encoder(args.input, output)
+        output = f"{model_name}-text_encoder-genai-wgpu-{args.precision}"
+        build_text_encoder(args.input, output, args.precision)
     elif args.model == "helper_models":
         helper_precision = helper_precision_from(args.precision)
         if args.precision not in ("f16", "f32"):
