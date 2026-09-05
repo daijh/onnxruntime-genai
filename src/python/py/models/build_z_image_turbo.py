@@ -107,35 +107,29 @@ def _link_or_copy(src, dst):
         shutil.copy2(src, dst)
 
 
-# Text encoder filename suffix per precision -- f32/f32_int4_quant aren't supported yet
-# (GroupQueryAttention under fp32 has never been verified for this Qwen3 config).
+# Text encoder filename suffix per precision, matching TRANSFORMER_FILENAME_SUFFIXES's
+# convention (its int4/fp16 variant is transformer_model_q4f16.onnx).
 TEXT_ENCODER_PRECISIONS = {
     "f16": "f16",
+    "f32": "f32",
     "f16_int4_quant": "q4f16",
+    "f32_int4_quant": "q4f32",
 }
 
 
 def build_text_encoder(input_path, output_dir, precision):
-    if precision not in TEXT_ENCODER_PRECISIONS:
-        print(
-            f"\n❌ ERROR: -m text_encoder / -m all does not support -p {precision}. "
-            f"The text encoder builder only supports {sorted(TEXT_ENCODER_PRECISIONS)} "
-            "(GroupQueryAttention under fp32 has not been verified for this Qwen3 config).",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
     text_encoder_dir = resolve_component_dir(input_path, "text_encoder")
     if not os.path.isfile(os.path.join(text_encoder_dir, "config.json")):
         print(f"Could not find text_encoder/config.json under {input_path}", file=sys.stderr)
         return
 
     suffix = TEXT_ENCODER_PRECISIONS[precision]
+    dtype = helper_precision_from(precision)
     os.makedirs(output_dir, exist_ok=True)
     output_onnx = os.path.join(output_dir, f"text_encoder_model_{suffix}.onnx")
     export_qwen3_text_encoder(
         text_encoder_dir, output_onnx, f"text_encoder_model_{suffix}.onnx.data",
-        quantize=(precision == "f16_int4_quant"),
+        quantize=(precision in ("f16_int4_quant", "f32_int4_quant")), dtype=dtype,
     )
     print("\n######\nSuccess")
 
@@ -247,15 +241,6 @@ def build_all(args):
         )
         sys.exit(1)
 
-    if args.precision not in TEXT_ENCODER_PRECISIONS:
-        print(
-            f"\n❌ ERROR: -m all does not support -p {args.precision} yet -- the text encoder "
-            f"builder only supports {sorted(TEXT_ENCODER_PRECISIONS)} (GroupQueryAttention under "
-            "fp32 has not been verified for this Qwen3 config). Use -p f16 or f16_int4_quant.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
     model_name = os.path.basename(os.path.normpath(args.input))
     bundle_dir = f"{model_name}-genai-wgpu-{args.precision}"
     onnx_dir = os.path.join(bundle_dir, "onnx")
@@ -349,8 +334,7 @@ if __name__ == "__main__":
             "Precision to build: f16/f32 (unquantized WebGPU I/O dtype) or "
             "f16_int4_quant/f32_int4_quant (int4-quantized weights with float16/float32 "
             "WebGPU I/O). Default: f16_int4_quant. For -m helper_models/safety_checker/"
-            "vae_decoder, only the f16-vs-f32 half applies (no int4 quantization). "
-            "-m text_encoder/all support only f16 and f16_int4_quant."
+            "vae_decoder, only the f16-vs-f32 half applies (no int4 quantization)."
         ),
     )
     args = parser.parse_args()

@@ -24,6 +24,10 @@ Q/K per-head RMSNorm kept as separate ops (not fused into GQA, so GQA stays at i
 capture-style reformatting subgraph) -- no `position_ids` input exists anywhere in
 this graph, external or internal. No KV cache graph inputs are ever emitted;
 GroupQueryAttention gets empty `past_key`/`past_value`.
+
+`dtype` ("f16" or "f32") controls the I/O and weight dtype throughout; `quantize`
+controls whether MatMul/Gather weights are int4-quantized afterward -- the two are
+independent, giving all four `f16`/`f32`/`f16_int4_quant`/`f32_int4_quant` precisions.
 """
 
 import json
@@ -52,7 +56,12 @@ def _read_qwen3_config(text_encoder_dir):
     }
 
 
-def _rotary_cos_sin_tables(head_size, rope_theta, max_position_embeddings):
+_TORCH_DTYPES = {"f16": torch.float16, "f32": torch.float32}
+_ONNX_DTYPES = {"f16": TensorProto.FLOAT16, "f32": TensorProto.FLOAT}
+_NP_DTYPES = {"f16": np.float16, "f32": np.float32}
+
+
+def _rotary_cos_sin_tables(head_size, rope_theta, max_position_embeddings, np_dtype):
     # Standard (non-scaled) Qwen3 RoPE: Z-Image-Turbo's checkpoint has rope_scaling=null.
     dim = head_size
     inv_freq = 1.0 / (rope_theta ** (np.arange(0, dim, 2, dtype=np.int64).astype(np.float64) / dim))
@@ -60,8 +69,8 @@ def _rotary_cos_sin_tables(head_size, rope_theta, max_position_embeddings):
     freqs = np.outer(t, inv_freq)
     emb = np.concatenate([freqs, freqs], axis=-1)
     # com.microsoft.RotaryEmbedding expects cos/sin caches of shape [max_seq_len, head_size/2]
-    cos_cache = np.cos(emb)[:, : dim // 2].astype(np.float16)
-    sin_cache = np.sin(emb)[:, : dim // 2].astype(np.float16)
+    cos_cache = np.cos(emb)[:, : dim // 2].astype(np_dtype)
+    sin_cache = np.sin(emb)[:, : dim // 2].astype(np_dtype)
     return cos_cache, sin_cache
 
 
@@ -131,17 +140,17 @@ def _qk_head_norm(gb, x, weight_name, num_heads, head_size, eps, name_prefix):
     return gb.node("Reshape", [normed, shape2], [f"{name_prefix}/Reshape_2/out"], f"{name_prefix}/Reshape_2")
 
 
-def _matmul(gb, x, weight_param, name_prefix):
+def _matmul(gb, x, weight_param, name_prefix, torch_dtype):
     # weight_param: an HF nn.Linear weight, shape [out_features, in_features]. ONNX MatMul
     # needs [in_features, out_features], so transpose. Qwen3 has no bias on any projection
     # (attention_bias=false, and the MLP/output projections don't use bias either).
-    weight = weight_param.detach().to(torch.float16).numpy().T
+    weight = weight_param.detach().to(torch_dtype).numpy().T
     weight_name = gb.initializer(f"{name_prefix}.weight", weight)
     return gb.node("MatMul", [x, weight_name], [f"{name_prefix}/out"], f"{name_prefix}/MatMul")
 
 
 def _build_decoder_layer(gb, layer_id, layer, root_residual, input_ln_skip, dims,
-                          seqlens_k_name, total_seq_len_name, cos_cache_name, sin_cache_name):
+                          seqlens_k_name, total_seq_len_name, cos_cache_name, sin_cache_name, torch_dtype):
     """Emits one full Qwen3 decoder layer (attention + MLP).
 
     root_residual: the residual stream entering this layer's input_layernorm (== the
@@ -161,7 +170,7 @@ def _build_decoder_layer(gb, layer_id, layer, root_residual, input_ln_skip, dims
 
     ln1_w = gb.initializer(
         f"model.layers.{layer_id}.input_layernorm.weight",
-        layer.input_layernorm.weight.detach().to(torch.float16).numpy(),
+        layer.input_layernorm.weight.detach().to(torch_dtype).numpy(),
     )
     normed, resid_before_attn = _simplified_layernorm(
         gb, root_residual, ln1_w, eps, f"layer{layer_id}/input_layernorm",
@@ -171,14 +180,14 @@ def _build_decoder_layer(gb, layer_id, layer, root_residual, input_ln_skip, dims
         resid_before_attn = root_residual
 
     attn = layer.self_attn
-    q = _matmul(gb, normed, attn.q_proj.weight, f"layer{layer_id}/attn/q_proj")
-    k = _matmul(gb, normed, attn.k_proj.weight, f"layer{layer_id}/attn/k_proj")
-    v = _matmul(gb, normed, attn.v_proj.weight, f"layer{layer_id}/attn/v_proj")
+    q = _matmul(gb, normed, attn.q_proj.weight, f"layer{layer_id}/attn/q_proj", torch_dtype)
+    k = _matmul(gb, normed, attn.k_proj.weight, f"layer{layer_id}/attn/k_proj", torch_dtype)
+    v = _matmul(gb, normed, attn.v_proj.weight, f"layer{layer_id}/attn/v_proj", torch_dtype)
 
     qn_w = gb.initializer(f"model.layers.{layer_id}.attn.q_norm.weight",
-                           attn.q_norm.weight.detach().to(torch.float16).numpy())
+                           attn.q_norm.weight.detach().to(torch_dtype).numpy())
     kn_w = gb.initializer(f"model.layers.{layer_id}.attn.k_norm.weight",
-                           attn.k_norm.weight.detach().to(torch.float16).numpy())
+                           attn.k_norm.weight.detach().to(torch_dtype).numpy())
     q = _qk_head_norm(gb, q, qn_w, num_attn_heads, head_size, eps, f"layer{layer_id}/attn/q_norm")
     k = _qk_head_norm(gb, k, kn_w, num_kv_heads, head_size, eps, f"layer{layer_id}/attn/k_norm")
 
@@ -196,11 +205,11 @@ def _build_decoder_layer(gb, layer_id, layer, root_residual, input_ln_skip, dims
         num_heads=num_attn_heads, kv_num_heads=num_kv_heads, scale=scale,
         local_window_size=-1, do_rotary=1, rotary_interleaved=0,
     )
-    o = _matmul(gb, attn_out, attn.o_proj.weight, f"layer{layer_id}/attn/o_proj")
+    o = _matmul(gb, attn_out, attn.o_proj.weight, f"layer{layer_id}/attn/o_proj", torch_dtype)
 
     post_ln_w = gb.initializer(
         f"model.layers.{layer_id}.post_attention_layernorm.weight",
-        layer.post_attention_layernorm.weight.detach().to(torch.float16).numpy(),
+        layer.post_attention_layernorm.weight.detach().to(torch_dtype).numpy(),
     )
     mlp_in, resid_before_mlp = _simplified_layernorm(
         gb, resid_before_attn, post_ln_w, eps, f"layer{layer_id}/post_attention_layernorm",
@@ -208,12 +217,12 @@ def _build_decoder_layer(gb, layer_id, layer, root_residual, input_ln_skip, dims
     )
 
     mlp = layer.mlp
-    gate = _matmul(gb, mlp_in, mlp.gate_proj.weight, f"layer{layer_id}/mlp/gate_proj")
-    up = _matmul(gb, mlp_in, mlp.up_proj.weight, f"layer{layer_id}/mlp/up_proj")
+    gate = _matmul(gb, mlp_in, mlp.gate_proj.weight, f"layer{layer_id}/mlp/gate_proj", torch_dtype)
+    up = _matmul(gb, mlp_in, mlp.up_proj.weight, f"layer{layer_id}/mlp/up_proj", torch_dtype)
     sig = gb.node("Sigmoid", [gate], [f"layer{layer_id}/mlp/sigmoid"], f"layer{layer_id}/mlp/Sigmoid")
     silu = gb.node("Mul", [gate, sig], [f"layer{layer_id}/mlp/silu"], f"layer{layer_id}/mlp/Mul_silu")
     gated = gb.node("Mul", [silu, up], [f"layer{layer_id}/mlp/gated"], f"layer{layer_id}/mlp/Mul_gated")
-    down = _matmul(gb, gated, mlp.down_proj.weight, f"layer{layer_id}/mlp/down_proj")
+    down = _matmul(gb, gated, mlp.down_proj.weight, f"layer{layer_id}/mlp/down_proj", torch_dtype)
 
     return resid_before_mlp, down
 
@@ -241,23 +250,29 @@ def _quantize_int4(onnx_model):
     return quantized
 
 
-def _build_encoder_graph(checkpoint_dir):
+def _build_encoder_graph(checkpoint_dir, dtype="f16"):
+    torch_dtype = _TORCH_DTYPES[dtype]
+    onnx_dtype = _ONNX_DTYPES[dtype]
+    np_dtype = _NP_DTYPES[dtype]
+
     dims = _read_qwen3_config(checkpoint_dir)
     num_layers = dims["num_layers"]
 
-    model = AutoModelForCausalLM.from_pretrained(checkpoint_dir, torch_dtype=torch.float16, low_cpu_mem_usage=True)
+    model = AutoModelForCausalLM.from_pretrained(checkpoint_dir, torch_dtype=torch_dtype, low_cpu_mem_usage=True)
     model.eval()
     layers = model.model.layers
 
     gb = _GraphBuilder()
     input_ids_name, attn_mask_name = "input_ids", "attention_mask"
 
-    cos_cache, sin_cache = _rotary_cos_sin_tables(dims["head_size"], dims["rope_theta"], dims["max_position_embeddings"])
+    cos_cache, sin_cache = _rotary_cos_sin_tables(
+        dims["head_size"], dims["rope_theta"], dims["max_position_embeddings"], np_dtype
+    )
     cos_cache_name = gb.initializer("cos_cache", cos_cache)
     sin_cache_name = gb.initializer("sin_cache", sin_cache)
 
     embed_w = gb.initializer("model.embed_tokens.weight",
-                              model.model.embed_tokens.weight.detach().to(torch.float16).numpy())
+                              model.model.embed_tokens.weight.detach().to(torch_dtype).numpy())
     embeddings = gb.node("Gather", [embed_w, input_ids_name], ["embeddings"], "embed/Gather", axis=0)
 
     seqlens_k_name, total_seq_len_name = _attention_mask_reformat(gb, attn_mask_name)
@@ -266,7 +281,7 @@ def _build_encoder_graph(checkpoint_dir):
     for layer_id in range(num_layers - 1):
         resid_before_mlp, mlp_out = _build_decoder_layer(
             gb, layer_id, layers[layer_id], root_residual, input_ln_skip, dims,
-            seqlens_k_name, total_seq_len_name, cos_cache_name, sin_cache_name,
+            seqlens_k_name, total_seq_len_name, cos_cache_name, sin_cache_name, torch_dtype,
         )
         root_residual, input_ln_skip = resid_before_mlp, mlp_out
 
@@ -276,7 +291,7 @@ def _build_encoder_graph(checkpoint_dir):
     tap_id = num_layers - 1
     tap_ln_w = gb.initializer(
         f"model.layers.{tap_id}.input_layernorm.weight",
-        layers[tap_id].input_layernorm.weight.detach().to(torch.float16).numpy(),
+        layers[tap_id].input_layernorm.weight.detach().to(torch_dtype).numpy(),
     )
     _, encoder_hidden_state = _simplified_layernorm(
         gb, root_residual, tap_ln_w, dims["rms_norm_eps"], f"layer{tap_id}/input_layernorm",
@@ -289,7 +304,7 @@ def _build_encoder_graph(checkpoint_dir):
         helper.make_tensor_value_info(attn_mask_name, TensorProto.INT64, ["batch_size", "total_sequence_length"]),
     ]
     graph_output = helper.make_tensor_value_info(
-        encoder_hidden_state, TensorProto.FLOAT16, ["batch_size", "sequence_length", dims["hidden_size"]]
+        encoder_hidden_state, onnx_dtype, ["batch_size", "sequence_length", dims["hidden_size"]]
     )
     graph = helper.make_graph(gb.nodes, "zimage_text_encoder", graph_inputs, [graph_output], initializer=gb.initializers)
     onnx_model = helper.make_model(
@@ -299,8 +314,8 @@ def _build_encoder_graph(checkpoint_dir):
     return onnx_model
 
 
-def export_qwen3_text_encoder(checkpoint_dir, output_onnx_path, external_data_name, quantize):
-    onnx_model = _build_encoder_graph(checkpoint_dir)
+def export_qwen3_text_encoder(checkpoint_dir, output_onnx_path, external_data_name, quantize, dtype="f16"):
+    onnx_model = _build_encoder_graph(checkpoint_dir, dtype=dtype)
     if quantize:
         onnx_model = _quantize_int4(onnx_model)
 

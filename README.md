@@ -108,24 +108,26 @@ weights only — it never touches the tokenizer) with `onnx.helper`, building on
 norm, and LM head are never built at all, not built-then-stripped):
 
 - taps the residual stream entering the last decoder layer's input norm (equivalent to
-  HuggingFace's `hidden_states[-2]`) as the output,
-- exposes it as a float16 `encoder_hidden_state` of shape `[1, seq, 2560]`, and
-- takes only `input_ids` and `attention_mask` as graph inputs — `position_ids` is computed
-  internally from `input_ids`, and there's no KV cache (a graph-capture-style mask-reformatting
-  subgraph derives `seqlens_k`/`total_seq_len` from `attention_mask` for `GroupQueryAttention`).
+  HuggingFace's `hidden_states[-2]`) as the output, exposed as `encoder_hidden_state` of shape
+  `[1, seq, 2560]`, and
+- takes only `input_ids` and `attention_mask` as graph inputs — there's no KV cache (a
+  graph-capture-style mask-reformatting subgraph derives `seqlens_k`/`total_seq_len` from
+  `attention_mask`) and no `position_ids` anywhere, external or internal: rotary embeddings are
+  fused directly into `GroupQueryAttention` (`do_rotary=1`), which derives each token's position
+  from `seqlens_k`/`total_seq_len` on its own.
 
-`-p` selects the precision: `f16` (unquantized float16 weights and I/O) or `f16_int4_quant`
-(int4-quantized `MatMul`/`Gather` weights via `MatMulNBitsQuantizer`, float16 I/O). `f32` and
-`f32_int4_quant` aren't supported (`GroupQueryAttention` under fp32 has never been verified for
-this Qwen3 config) and fail fast with an error instead of silently building something else.
+`-p` selects the precision: `f16`/`f32` (unquantized weights and I/O in that dtype) or
+`f16_int4_quant`/`f32_int4_quant` (int4-quantized `MatMul`/`Gather` weights via
+`MatMulNBitsQuantizer`, float16/float32 I/O respectively).
 
 Output goes to `<model_name>-text_encoder-genai-wgpu-<precision>/text_encoder_model_<suffix>.onnx`
-(+ `.onnx_data`), where `<suffix>` is `f16` or `q4f16` matching `-p`. The `q4f16` variant is a
-drop-in for the WebNN bundle's `onnx/text_encoder_model_q4f16.onnx`.
+(+ `.onnx.data`), where `<suffix>` is `f16`/`f32`/`q4f16`/`q4f32` matching `-p`. The `q4f16`
+variant is a drop-in for the WebNN bundle's `onnx/text_encoder_model_q4f16.onnx`.
 
 > Q/K per-head RMSNorm stays as separate `SimplifiedLayerNormalization` ops rather than fused
 > into `GroupQueryAttention`, so GQA keeps ≤12 inputs (rotary stays fused inside GQA). A fused
-> form would emit a 16-input GQA that current onnxruntime-web / onnxruntime 1.24 reject at load.
+> QK-norm form would emit a 16-input GQA that current onnxruntime-web / onnxruntime 1.24 reject
+> at load.
 
 ## Building the Helper Models
 
@@ -206,10 +208,7 @@ self-contained file (weights inline, no `.onnx.data`), a drop-in for the WebNN b
 ## Building Everything at Once
 
 `-m all` builds the transformer, text encoder, helper models, safety checker, and VAE decoder in
-one command, into a single bundle-shaped directory (`--safety_checker_checkpoint` is required).
-Since the text encoder only supports `f16`/`f16_int4_quant` (see
-[Building the Text Encoder](#building-the-text-encoder)), `-m all` fails fast with an error for
-`-p f32`/`f32_int4_quant` before building anything, rather than building a partial bundle:
+one command, into a single bundle-shaped directory (`--safety_checker_checkpoint` is required):
 
 ```bash
 python build_z_image_turbo.py path_to_local_folder -m all -p f16_int4_quant \
@@ -221,25 +220,24 @@ Output goes to `<model_name>-genai-wgpu-<precision>/`, laid out like the WebNN b
 ```
 <model_name>-genai-wgpu-<precision>/
   onnx/
-    transformer_model_<f16|q4f16>.onnx(.data)
-    text_encoder_model_<f16|q4f16>.onnx(_data)
-    scheduler_step_model_<f16>.onnx
-    vae_pre_process_model_<f16>.onnx
-    sc_prep_model_<f16>.onnx
-    safety_checker_model_<f16>.onnx
-    vae_decoder_model_<f16>.onnx
+    transformer_model_<f16|f32|q4f16|q4f32>.onnx(.data)
+    text_encoder_model_<f16|f32|q4f16|q4f32>.onnx(.data)
+    scheduler_step_model_<f16|f32>.onnx
+    vae_pre_process_model_<f16|f32>.onnx
+    sc_prep_model_<f16|f32>.onnx
+    safety_checker_model_<f16|f32>.onnx
+    vae_decoder_model_<f16|f32>.onnx
   tokenizer/
     ...
 ```
 
-The transformer and text encoder filename suffixes both match `-p` exactly (`f16`->`f16`/
-`f16_int4_quant`->`q4f16`, mirroring the WebNN bundle's own `transformer_model_q4f16.onnx`/
-`text_encoder_model_q4f16.onnx` convention). Everything else's precision is derived from `-p`'s
-f16-vs-f32 half, which for `-m all` is always `f16` since only `f16`/`f16_int4_quant` are
-accepted — the VAE decoder gets no int4/int8 quant here (unquantized, decomposed GroupNorm,
-matching the WebNN bundle's own `vae_decoder_model_f16.onnx`); for quantization or
-`fuse_group_norm=true`, build it standalone with `-m vae_decoder` or call `builder.py` directly
-(see [ZIMAGE_VAE_USAGE.md](src/python/py/models/builders/ZIMAGE_VAE_USAGE.md)).
+The transformer and text encoder filename suffixes both match `-p` exactly (`f16`->`f16`,
+`f32`->`f32`, `f16_int4_quant`->`q4f16`, `f32_int4_quant`->`q4f32`, mirroring the WebNN bundle's
+own `transformer_model_q4f16.onnx`/`text_encoder_model_q4f16.onnx` convention). Everything else's
+precision is derived from `-p`'s f16-vs-f32 half — the VAE decoder gets no int4/int8 quant here
+(unquantized, decomposed GroupNorm, matching the WebNN bundle's own `vae_decoder_model_f16.onnx`);
+for quantization or `fuse_group_norm=true`, build it standalone with `-m vae_decoder` or call
+`builder.py` directly (see [ZIMAGE_VAE_USAGE.md](src/python/py/models/builders/ZIMAGE_VAE_USAGE.md)).
 
 This bundle is fully self-contained — no WebNN bundle needed at all. Point `run_z_image_turbo.py`
 at it directly (see [Running the Full Pipeline](#running-the-full-pipeline-text-to-image)); for
