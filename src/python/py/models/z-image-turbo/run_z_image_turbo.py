@@ -120,11 +120,14 @@ def log_session_io(label: str, session: ort.InferenceSession) -> None:
         print(f"    {o.name}: {o.type} {o.shape}")
 
 
-def save_image(vae_output: np.ndarray, path: str) -> None:
+def to_uint8_hwc(vae_output: np.ndarray) -> np.ndarray:
     # vae_output: (1, 3, H, W) float, normalized to [-1, 1].
     chw = vae_output[0].astype(np.float32)
     chw = np.clip(chw * 0.5 + 0.5, 0.0, 1.0)
-    hwc = (chw * 255.0 + 0.5).astype(np.uint8).transpose(1, 2, 0)
+    return (chw * 255.0 + 0.5).astype(np.uint8).transpose(1, 2, 0)
+
+
+def save_image(hwc: np.ndarray, path: str) -> None:
     Image.fromarray(hwc, mode="RGB").save(path)
     print(f"Image saved to {path} ({os.path.getsize(path) / 1024:.1f} KB)")
 
@@ -152,7 +155,8 @@ class Scheduler:
 
 
 class ZImagePipeline:
-    def __init__(self, model_dir: str, ep: str, gpu: int = 0):
+    def __init__(self, model_dir: str, ep: str, gpu: int = 0, sync: bool = False):
+        self.sync = sync
         available = ort.get_available_providers()
         use_webgpu = ep == "WebGPU" or (not ep and "WebGpuExecutionProvider" in available)
         if ep == "WebGPU" and "WebGpuExecutionProvider" not in available:
@@ -231,8 +235,20 @@ class ZImagePipeline:
                 iob.bind_ortvalue_input(name, value)
         for name in output_names:
             iob.bind_output(name, device_type=self.device_type, device_id=self.device_id)
+        if self.sync:
+            iob.synchronize_inputs()
         session.run_with_iobinding(iob)
         outputs = iob.get_outputs()
+        if self.sync:
+            # WebGPU dispatch is asynchronous: run_with_iobinding only submits the compute to the
+            # GPU queue and returns immediately. IOBinding.synchronize_outputs() alone doesn't
+            # force a wait for outputs that stay device-resident -- reading each one back to
+            # host does, so that's the only reliable way to get a per-call time that reflects
+            # actual compute instead of just CPU-side submission overhead. Off by default since
+            # it serializes every step (each call blocks on the previous step's GPU work).
+            iob.synchronize_outputs()
+            for value in outputs:
+                value.numpy()
         self._log_io(label, inputs, output_names, outputs)
         return outputs
 
@@ -312,7 +328,10 @@ class ZImagePipeline:
             start = time.perf_counter()
             result = fn(*a)
             ms = (time.perf_counter() - start) * 1000
-            print(f"{label} time: {ms:.2f} ms")
+            if self.sync:
+                # Without --sync these per-call numbers are meaningless (WebGPU dispatch is
+                # async -- see _run_bound), so only show them when they're actually trustworthy.
+                print(f"{label} time: {ms:.2f} ms")
             total_ms += ms
             return result
 
@@ -327,11 +346,22 @@ class ZImagePipeline:
 
             if all_images and step < num_inference_steps - 1:
                 path = Path(output_path)
-                save_image(self._decode(latents_ov).numpy(), str(path.with_name(f"{path.stem}-step{step}{path.suffix}")))
+                hwc = to_uint8_hwc(self._decode(latents_ov).numpy())
+                save_image(hwc, str(path.with_name(f"{path.stem}-step{step}{path.suffix}")))
 
         scaled_latents_ov = timed("vae_pre_process", self._run_vae_pre_process, latents_ov)
         image_ov = timed("vae_decoder", self._run_vae_decoder, scaled_latents_ov)
-        save_image(image_ov.numpy(), output_path)
+
+        def _postprocess():
+            # image_ov.numpy() is the read that forces the final GPU sync -- keep it (and the
+            # uint8/HWC conversion) inside the timed window so total_ms always reflects the full
+            # pipeline, not just whichever step happens to force a sync first (see CHANGELOG.md).
+            # The actual PNG encode + disk write below is excluded -- that's file I/O, not part
+            # of the inference pipeline.
+            return to_uint8_hwc(image_ov.numpy())
+
+        hwc = timed("postprocess", _postprocess)
+        save_image(hwc, output_path)
         print(f"total time: {total_ms:.2f} ms")
 
     def _run_transformer(self, latents_ov: ort.OrtValue, timestep: float, prompt_embeds_ov: ort.OrtValue) -> ort.OrtValue:
@@ -396,6 +426,12 @@ def parse_args():
     parser.add_argument("-o", "--output_name", default="z-image-turbo.png", help="Output image path.")
     parser.add_argument("-l", "--loop", type=int, default=1, help="Number of times to repeat generation (for benchmarking).")
     parser.add_argument("-a", "--all_images", action="store_true", help="Also write an image after every denoising step.")
+    parser.add_argument(
+        "--sync", action="store_true",
+        help="Force a GPU sync after every model call for accurate per-call timing (default: off; "
+        "WebGPU dispatch is otherwise async, so per-call times would only reflect submission "
+        "overhead, not real compute time -- see CHANGELOG.md).",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Latent noise seed.")
     return parser.parse_args()
 
@@ -414,7 +450,7 @@ def main():
             "populate it."
         )
 
-    pipeline = ZImagePipeline(args.model, args.ep, args.gpu)
+    pipeline = ZImagePipeline(args.model, args.ep, args.gpu, args.sync)
 
     output_name = Path(args.output_name)
     stem = f"{output_name.stem}_{args.width}x{args.height}_steps{args.step}"
