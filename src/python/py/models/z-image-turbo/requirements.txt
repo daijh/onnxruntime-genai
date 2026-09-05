@@ -24,5 +24,7 @@ numpy
 # build_helper_models.py's f16 conversion pass (no Model/onnxruntime-genai dependency there).
 onnxconverter-common
 
-# run_z_image_turbo.py's image writer.
+# run_z_image_turbo.py's image writer and peak-memory reporting (psutil is used instead of the
+# stdlib `resource` module since `resource` is POSIX-only and unavailable on Windows).
 pillow
+psutil
