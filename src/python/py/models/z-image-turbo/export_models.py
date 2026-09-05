@@ -19,16 +19,26 @@ depends only on the public onnxruntime-genai pip package, not on this repo's own
     text_encoder   -> build_text_encoder.py  (not yet ported)
     safety_checker -> build_safety_checker.py (not yet ported)
     all            -> every component above, in one bundle directory
+
+Also copies the checkpoint's tokenizer files into `<output_dir>/tokenizer/` (see
+../build_z_image_turbo.py, which does the same) so the exported directory is self-contained
+and can be pointed at directly, e.g. by run_z_image_turbo.py.
 """
 
 import argparse
 import os
+import shutil
+import sys
 
 import build_helper_models
 import build_transformer
 import build_vae_decoder
 
 NOT_YET_PORTED = ("text_encoder", "safety_checker")
+
+# Small tokenizer files that AutoTokenizer.from_pretrained needs; they live in the checkpoint's
+# sibling `tokenizer/` folder, not `text_encoder/`.
+TOKENIZER_FILES = ("merges.txt", "tokenizer.json", "tokenizer_config.json", "vocab.json")
 
 
 def get_args():
@@ -77,6 +87,47 @@ def build_one(model, input_path, output_dir, extra_options):
     raise ValueError(f"Unknown -m/--model value: {model}")
 
 
+def resolve_tokenizer_dir(input_path):
+    # The tokenizer lives beside the text_encoder folder (repo_root/tokenizer), regardless of
+    # whether input_path is the repo root or a component subfolder itself.
+    text_encoder_dir = input_path
+    if os.path.isdir(os.path.join(input_path, "text_encoder")):
+        text_encoder_dir = os.path.join(input_path, "text_encoder")
+    return os.path.join(os.path.dirname(os.path.normpath(text_encoder_dir)), "tokenizer")
+
+
+def _link_or_copy(src, dst):
+    # Prefer a cheap hardlink (same volume); fall back to a copy across volumes.
+    if os.path.exists(dst):
+        os.remove(dst)
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
+
+def copy_tokenizer(input_path, output_dir):
+    tokenizer_dir = resolve_tokenizer_dir(input_path)
+    if not os.path.isdir(tokenizer_dir):
+        print(f"Skipping tokenizer copy: {tokenizer_dir} not found", file=sys.stderr)
+        return
+
+    dest_dir = os.path.join(output_dir, "tokenizer")
+    os.makedirs(dest_dir, exist_ok=True)
+    missing = []
+    for fname in TOKENIZER_FILES:
+        src = os.path.join(tokenizer_dir, fname)
+        if os.path.isfile(src):
+            _link_or_copy(src, os.path.join(dest_dir, fname))
+        else:
+            missing.append(fname)
+
+    if missing:
+        print(f"Warning: tokenizer files not found in {tokenizer_dir}: {missing}", file=sys.stderr)
+    else:
+        print(f"Copied tokenizer to {dest_dir}")
+
+
 def main():
     args = get_args()
     if args.model == "all":
@@ -88,6 +139,8 @@ def main():
                 print(f"Skipping {model}: {e}")
     else:
         onnx_dir = build_one(args.model, args.input_path, args.output_dir, args.extra_options)
+
+    copy_tokenizer(args.input_path, args.output_dir)
     print(f"\nSuccess: {args.model} exported to {onnx_dir}")
 
 

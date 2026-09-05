@@ -66,7 +66,12 @@ python build_helper_models.py -o my_output_dir -p f16
 All `.onnx` output (+ external data) lands under `<output_dir>/onnx/`, so multiple components
 can share one output directory. No `genai_config.json` is produced -- these are standalone
 ONNX graphs, not onnxruntime-genai C++ runtime integrations. A caller drives the diffusion
-sampling loop itself; see `../run_z_image_turbo.py` for a reference driver.
+sampling loop itself; see `run_z_image_turbo.py` for a reference driver.
+
+`export_models.py` (but not the individual `build_*.py` scripts) also copies the checkpoint's
+tokenizer files (`merges.txt`, `tokenizer.json`, `tokenizer_config.json`, `vocab.json` -- from
+the checkpoint's `tokenizer/` folder, resolved relative to `text_encoder/`) into
+`<output_dir>/tokenizer/`, so the output directory is self-contained.
 
 ### Options
 
