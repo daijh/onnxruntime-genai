@@ -155,8 +155,9 @@ class Scheduler:
 
 
 class ZImagePipeline:
-    def __init__(self, model_dir: str, ep: str, gpu: int = 0, sync: bool = False):
+    def __init__(self, model_dir: str, ep: str, gpu: int = 0, sync: bool = False, safety_checker: bool = False):
         self.sync = sync
+        self.use_safety_checker = safety_checker
         available = ort.get_available_providers()
         use_webgpu = ep == "WebGPU" or (not ep and "WebGpuExecutionProvider" in available)
         if ep == "WebGPU" and "WebGpuExecutionProvider" not in available:
@@ -209,6 +210,31 @@ class ZImagePipeline:
         self.scheduler_step_output = self.scheduler_step.get_outputs()[0].name
         self.vae_pre_process_output = self.vae_pre_process.get_outputs()[0].name
         self.vae_decoder_output = self.vae_decoder.get_outputs()[0].name
+
+        # Optional NSFW check (sc_prep resizes + CLIP-normalizes the raw VAE image,
+        # safety_checker classifies it), mirroring ../run_z_image_turbo.py's --safety_checker.
+        # Loads an extra ~580 MB safety_checker model; its runtime is deliberately excluded from
+        # the pipeline's total-time metric (see run()), same as the old script.
+        if self.use_safety_checker:
+            sc_prep_path = os.path.join(onnx_dir, "sc_prep_model_f16.onnx")
+            safety_checker_path = os.path.join(onnx_dir, "safety_checker_model_f16.onnx")
+            for path in (sc_prep_path, safety_checker_path):
+                if not os.path.isfile(path):
+                    raise SystemExit(
+                        f"--safety_checker requested but {path} is missing -- build it with "
+                        "build_safety_checker.py (see export_models.py's "
+                        "--safety_checker_checkpoint)."
+                    )
+            self.sc_prep = ort.InferenceSession(sc_prep_path, **session_kwargs)
+            self.safety_checker = ort.InferenceSession(safety_checker_path, **session_kwargs)
+            self.sc_prep_iob = self.sc_prep.io_binding()
+            self.safety_checker_iob = self.safety_checker.io_binding()
+            log_session_io("sc_prep", self.sc_prep)
+            log_session_io("safety_checker", self.safety_checker)
+            self.sc_prep_dtype = input_dtype(self.sc_prep, "sample")
+            self.safety_checker_dtype = input_dtype(self.safety_checker, "clip_input")
+            self.sc_prep_output = self.sc_prep.get_outputs()[0].name
+            self.safety_checker_output = self.safety_checker.get_outputs()[0].name
 
         self.tokenizer = AutoTokenizer.from_pretrained(os.path.join(model_dir, "tokenizer"))
         self.scheduler = Scheduler()
@@ -340,6 +366,10 @@ class ZImagePipeline:
 
         for step in range(num_inference_steps):
             timestep = timesteps[step]
+            if not self.sync:
+                # Per-call times are suppressed without --sync (they'd be meaningless -- WebGPU
+                # dispatch is async), so print step progress on its own for visibility instead.
+                print(f"step {step}/{num_inference_steps}, timestep {timestep:.4f}")
 
             noise_pred_ov = timed(f"transformer-{step}", self._run_transformer, latents_ov, timestep, prompt_embeds)
             latents_ov = timed(f"scheduler_step-{step}", self._run_scheduler_step, noise_pred_ov, latents_ov, step, num_inference_steps)
@@ -363,6 +393,15 @@ class ZImagePipeline:
         hwc = timed("postprocess", _postprocess)
         save_image(hwc, output_path)
         print(f"total time: {total_ms:.2f} ms")
+
+        # Runs after total time is reported and is NOT included in it, matching
+        # ../run_z_image_turbo.py's --safety_checker sequencing.
+        if self.use_safety_checker:
+            start = time.perf_counter()
+            nsfw = self._run_safety_checker(image_ov)
+            ms = (time.perf_counter() - start) * 1000
+            print(f"safety_checker time (excluded from total): {ms:.2f} ms")
+            print(f"Safety Checker - NSFW: {'Yes' if nsfw else 'No'}")
 
     def _run_transformer(self, latents_ov: ort.OrtValue, timestep: float, prompt_embeds_ov: ort.OrtValue) -> ort.OrtValue:
         inputs = {
@@ -403,6 +442,22 @@ class ZImagePipeline:
     def _decode(self, latents_ov: ort.OrtValue) -> ort.OrtValue:
         return self._run_vae_decoder(self._run_vae_pre_process(latents_ov))
 
+    def _run_safety_checker(self, image_ov: ort.OrtValue) -> bool:
+        # sc_prep's "sample" is the raw, still-normalized-to-[-1,1] VAE decoder output (not the
+        # postprocessed uint8 image) -- matches ../run_z_image_turbo.py's run_safety_checker.
+        if self.vae_decoder_dtype != self.sc_prep_dtype:
+            image_ov = self.to_ort_value(image_ov.numpy().astype(self.sc_prep_dtype))
+        clip_input_ov = self._run_bound(
+            "sc_prep", self.sc_prep, self.sc_prep_iob, [self.sc_prep_output], {"sample": image_ov}
+        )[0]
+        if self.sc_prep_dtype != self.safety_checker_dtype:
+            clip_input_ov = self.to_ort_value(clip_input_ov.numpy().astype(self.safety_checker_dtype))
+        has_nsfw_ov = self._run_bound(
+            "safety_checker", self.safety_checker, self.safety_checker_iob, [self.safety_checker_output],
+            {"clip_input": clip_input_ov},
+        )[0]
+        return bool(has_nsfw_ov.numpy().ravel()[0])
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -433,6 +488,12 @@ def parse_args():
         "overhead, not real compute time -- see CHANGELOG.md).",
     )
     parser.add_argument("--seed", type=int, default=42, help="Latent noise seed.")
+    parser.add_argument(
+        "--safety_checker", action="store_true",
+        help="Run the optional NSFW safety checker (sc_prep + safety_checker_model_f16.onnx, "
+        "~580 MB extra; build both with build_safety_checker.py first). Its runtime is printed "
+        "separately and is NOT included in the pipeline's total-time metric.",
+    )
     return parser.parse_args()
 
 
@@ -450,7 +511,7 @@ def main():
             "populate it."
         )
 
-    pipeline = ZImagePipeline(args.model, args.ep, args.gpu, args.sync)
+    pipeline = ZImagePipeline(args.model, args.ep, args.gpu, args.sync, args.safety_checker)
 
     output_name = Path(args.output_name)
     stem = f"{output_name.stem}_{args.width}x{args.height}_steps{args.step}"
