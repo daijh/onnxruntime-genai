@@ -14,11 +14,11 @@ depends only on the public onnxruntime-genai pip package, not on this repo's own
 
 -m/--model selects which component to build; each maps to one build_*.py's `build()`:
     transformer    -> build_transformer.py     (implemented)
+    text_encoder   -> build_text_encoder.py    (implemented)
     vae_decoder    -> build_vae_decoder.py     (implemented)
     helper_models  -> build_helper_models.py   (implemented)
     safety_checker -> build_safety_checker.py  (implemented; needs its own separate
                        checkpoint, see --safety_checker_checkpoint)
-    text_encoder   -> build_text_encoder.py    (not yet ported)
     all            -> every component above, in one bundle directory (safety_checker is
                        skipped, with a message, if --safety_checker_checkpoint isn't given)
 
@@ -34,10 +34,11 @@ import sys
 
 import build_helper_models
 import build_safety_checker
+import build_text_encoder
 import build_transformer
 import build_vae_decoder
 
-NOT_YET_PORTED = ("text_encoder",)
+NOT_YET_PORTED = ()
 
 # Small tokenizer files that AutoTokenizer.from_pretrained needs; they live in the checkpoint's
 # sibling `tokenizer/` folder, not `text_encoder/`.
@@ -77,6 +78,13 @@ def build_one(model, input_path, output_dir, extra_options, safety_checker_check
             transformer_input = os.path.join(input_path, "transformer")
         return build_transformer.build(
             transformer_input, output_dir, extra_options=build_transformer.parse_extra_options(extra_options)
+        )
+    if model == "text_encoder":
+        text_encoder_input = input_path
+        if os.path.isdir(os.path.join(input_path, "text_encoder")):
+            text_encoder_input = os.path.join(input_path, "text_encoder")
+        return build_text_encoder.build(
+            text_encoder_input, output_dir, extra_options=build_text_encoder.parse_extra_options(extra_options)
         )
     if model == "vae_decoder":
         vae_input = input_path
@@ -151,7 +159,7 @@ def main():
     args = get_args()
     if args.model == "all":
         onnx_dir = args.output_dir
-        for model in ("transformer", "vae_decoder", "helper_models", "safety_checker", *NOT_YET_PORTED):
+        for model in ("transformer", "text_encoder", "vae_decoder", "helper_models", "safety_checker", *NOT_YET_PORTED):
             try:
                 onnx_dir = build_one(
                     model, args.input_path, args.output_dir, args.extra_options, args.safety_checker_checkpoint
