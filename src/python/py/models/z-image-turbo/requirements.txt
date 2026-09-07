@@ -1,30 +1,43 @@
-# Self-contained Z-Image-Turbo exporter experiment.
+# Dependencies for export_models.py and the build_*.py exporters ONLY (transformer, text
+# encoder, VAE decoder, helper models, safety checker). For running inference against an
+# exported model (run_z_image_turbo.py / run_z_image_turbo_legacy.py), see requirements-run.txt
+# instead -- the run scripts never import onnxruntime_genai, onnx, torch's export machinery, or
+# diffusers, so they don't need this file's onnxruntime-genai/onnx/onnx-ir/diffusers/tqdm/
+# onnxconverter-common entries.
 #
-# Unlike ../builders/zimage.py (which reaches into this repo's own
-# ../builders/base.py), build_transformer.py depends only on the *public*
-# onnxruntime-genai package for its `Model` base class -- pin below is the
-# latest version on PyPI (also the one this experiment was verified against).
-# Only ships wheels for Python 3.11/3.12/3.13 -- use one of those interpreters.
+# Unlike ../builders/zimage*.py (which reach into this repo's own ../builders/base.py), these
+# build_*.py scripts depend only on the *public* onnxruntime-genai package for their `Model`
+# base class, so each one runs standalone with just `pip install -r requirements.txt` -- no
+# onnxruntime-genai checkout required. Only ships wheels for Python 3.11/3.12/3.13 -- use one
+# of those interpreters.
+#
+# Every pin below is the latest version on PyPI as of 2026-09-07, except onnx-ir (see its own
+# comment) -- verified in this session: build_transformer.py, build_text_encoder.py,
+# build_vae_decoder.py, build_helper_models.py, and build_safety_checker.py all still build and
+# run correctly against these exact versions.
 onnxruntime-genai==0.15.2
 
-# onnxruntime-genai's `Model` base class imports these itself (int4
-# MatMulNBits quantization lives in `onnxruntime`, a separate package from
-# `onnxruntime-genai`; `transformers`/`tqdm` are imported unconditionally
-# even though this transformer trunk doesn't use HF AutoConfig/AutoTokenizer).
-onnxruntime>=1.20
-transformers>=4.40
-tqdm
+# onnxruntime-genai's `Model` base class imports these itself (int4 MatMulNBits quantization
+# lives in `onnxruntime`, a separate package from `onnxruntime-genai`; `transformers`/`tqdm`
+# are imported unconditionally even though the transformer trunk doesn't use HF
+# AutoConfig/AutoTokenizer). build_text_encoder.py also uses
+# `onnxruntime.quantization.matmul_nbits_quantizer` and `transformers.AutoModelForCausalLM`
+# directly.
+onnxruntime==1.29.0
+transformers==5.16.1
+tqdm==4.70.0
 
-onnx
-onnx-ir
-torch
-diffusers
-numpy
+onnx==1.22.0
+# Held back from the latest 1.0.0 (a major-version jump from the 0.x line this experiment was
+# built and verified against): onnxruntime-genai's `Model` base class builds its IR graph
+# through this package internally, and 1.0.0's API surface hasn't been verified against it in
+# this session -- bump only after confirming build_transformer.py/build_vae_decoder.py still
+# produce correct output.
+onnx-ir==0.2.1
+torch==2.14.0
+diffusers==0.40.0
+numpy==2.5.3
 
-# build_helper_models.py's f16 conversion pass (no Model/onnxruntime-genai dependency there).
-onnxconverter-common
-
-# run_z_image_turbo.py's image writer and peak-memory reporting (psutil is used instead of the
-# stdlib `resource` module since `resource` is POSIX-only and unavailable on Windows).
-pillow
-psutil
+# build_helper_models.py's / build_safety_checker.py's f16 conversion pass (no
+# Model/onnxruntime-genai dependency there).
+onnxconverter-common==1.16.0
