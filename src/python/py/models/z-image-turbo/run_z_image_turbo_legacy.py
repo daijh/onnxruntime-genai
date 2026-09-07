@@ -150,7 +150,7 @@ def save_image(hwc: np.ndarray, path: str) -> None:
 
 class Scheduler:
     """Flow-matching (shift=3) timestep schedule -- must match the sigma schedule baked into
-    scheduler_step_model_f16.onnx (see models/build_helper_models.py)."""
+    scheduler_step_model_f16.onnx (see build_helper_models.py)."""
 
     NUM_TRAIN_TIMESTEPS = 1000
     SHIFT = 3.0

@@ -12,12 +12,12 @@ Self-contained experiment (see requirements.txt): every build_*.py this dispatch
 depends only on the public onnxruntime-genai pip package, not on this repo's own
 ../builders/ source tree.
 
--m/--model selects which component to build; each maps to one models/build_*.py's `build()`:
-    transformer    -> models/build_transformer.py     (implemented)
-    text_encoder   -> models/build_text_encoder.py    (implemented)
-    vae_decoder    -> models/build_vae_decoder.py     (implemented)
-    helper_models  -> models/build_helper_models.py   (implemented)
-    safety_checker -> models/build_safety_checker.py  (implemented; needs its own separate
+-m/--model selects which component to build; each maps to one build_*.py's `build()`:
+    transformer    -> build_transformer.py     (implemented)
+    text_encoder   -> build_text_encoder.py    (implemented)
+    vae_decoder    -> build_vae_decoder.py     (implemented)
+    helper_models  -> build_helper_models.py   (implemented)
+    safety_checker -> build_safety_checker.py  (implemented; needs its own separate
                        checkpoint, see --safety_checker_checkpoint)
     all            -> every component above, in one bundle directory (safety_checker is
                        skipped, with a message, if --safety_checker_checkpoint isn't given)
@@ -31,8 +31,6 @@ import argparse
 import os
 import shutil
 import sys
-
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "models"))
 
 import build_helper_models
 import build_safety_checker

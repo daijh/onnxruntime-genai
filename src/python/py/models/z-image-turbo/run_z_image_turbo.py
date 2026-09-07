@@ -134,7 +134,7 @@ def save_image(hwc: np.ndarray, path: str) -> None:
 
 class Scheduler:
     """Flow-matching (shift=3) timestep schedule -- must match the sigma schedule baked into
-    scheduler_step_model_f16.onnx (see models/build_helper_models.py)."""
+    scheduler_step_model_f16.onnx (see build_helper_models.py)."""
 
     NUM_TRAIN_TIMESTEPS = 1000
     SHIFT = 3.0
@@ -222,7 +222,7 @@ class ZImagePipeline:
                 if not os.path.isfile(path):
                     raise SystemExit(
                         f"--safety_checker requested but {path} is missing -- build it with "
-                        "models/build_safety_checker.py (see export_models.py's "
+                        "build_safety_checker.py (see export_models.py's "
                         "--safety_checker_checkpoint)."
                     )
             self.sc_prep = ort.InferenceSession(sc_prep_path, **session_kwargs)
@@ -314,7 +314,7 @@ class ZImagePipeline:
         )[0]
 
         # Slicing to the real prompt length and padding to a multiple of 32 tokens (the
-        # transformer has no attention-mask/padding logic, see models/build_transformer.py) needs
+        # transformer has no attention-mask/padding logic, see build_transformer.py) needs
         # host-side numpy; this is a one-time per-prompt cost, not part of the per-step
         # denoising loop, so it's fine to round-trip through host memory here.
         embeds = embeds_ov.numpy()[:, :seq_len, :]
@@ -491,7 +491,7 @@ def parse_args():
     parser.add_argument(
         "--safety_checker", action="store_true",
         help="Run the optional NSFW safety checker (sc_prep + safety_checker_model_f16.onnx, "
-        "~580 MB extra; build both with models/build_safety_checker.py first). Its runtime is printed "
+        "~580 MB extra; build both with build_safety_checker.py first). Its runtime is printed "
         "separately and is NOT included in the pipeline's total-time metric.",
     )
     return parser.parse_args()
