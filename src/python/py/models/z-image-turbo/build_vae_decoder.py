@@ -132,14 +132,16 @@ class ZImageVAEDecoderModel(Model):
         self.input_names = {"latent_sample": "latent_sample"}
         self.output_names = {"sample": "sample"}
 
+        # batch is fixed at 1 across the whole pipeline (the transformer hardcodes batch=1), so
+        # pin it here too -- a static leading dim helps ORT's graph optimizations.
         latent = self.make_value(
             "latent_sample", self._io_dtype,
-            shape=["batch_size", self.latent_channels, "latent_height", "latent_width"],
+            shape=[1, self.latent_channels, "latent_height", "latent_width"],
         )
         self.model.graph.inputs.extend([latent])
 
         sample = self.make_value(
-            "sample", self._io_dtype, shape=["batch_size", self.out_channels, "height", "width"]
+            "sample", self._io_dtype, shape=[1, self.out_channels, "height", "width"]
         )
         self.model.graph.outputs.append(sample)
 

@@ -58,6 +58,25 @@ def parse_extra_options(pairs):
     return extra_options
 
 
+def optimize_onnx_graph(onnx_path):
+    """Run ORT's EP-neutral (BASIC-level) graph optimizations on `onnx_path`, in place.
+
+    `clip_input` is now a static `[1, 3, 224, 224]`, so ORT can constant-fold the
+    Shape/Gather/Concat/Reshape machinery `torch.onnx.export` emits for dynamic shapes.
+    BASIC stays EP-neutral (standard ONNX ops only -- no CPU-specific fused/layout ops that
+    the pipeline's target WebGPU EP might lack a kernel for), so the optimized graph still
+    runs on WebGPU as well as CPU. Applied on the f32 graph, before the f16 conversion, so
+    constant folding never hits a missing CPU f16 kernel.
+    """
+    tmp_path = onnx_path + ".opt.tmp"
+    sess_options = ort.SessionOptions()
+    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+    sess_options.optimized_model_filepath = tmp_path
+    ort.InferenceSession(onnx_path, sess_options, providers=["CPUExecutionProvider"])
+    os.replace(tmp_path, onnx_path)
+    print(f"  optimized {onnx_path} ({os.path.getsize(onnx_path) / (1024 * 1024):.1f} MB)")
+
+
 class SafetyCheckerOnnxWrapper(nn.Module):
     """`StableDiffusionSafetyChecker.forward_onnx` minus the `images` masking I/O."""
 
@@ -118,15 +137,18 @@ def build(input_path, output_dir, precision="f16", extra_options=None, opset=17)
         f32_path,
         input_names=["clip_input"],
         output_names=["has_nsfw_concepts"],
-        dynamic_axes={
-            "clip_input": {0: "batch"},
-            "has_nsfw_concepts": {0: "batch"},
-        },
+        # batch is fixed at 1 across the whole pipeline (the transformer hardcodes batch=1);
+        # no dynamic axes so the leading dim stays a static 1 (dummy input is batch=1).
+        dynamic_axes={},
         opset_version=opset,
         do_constant_folding=True,
         dynamo=False,
     )
     print(f"  wrote {f32_path} ({os.path.getsize(f32_path) / (1024 * 1024):.1f} MB)")
+
+    # The graph is now fully static-shape (batch fixed at 1); fold the dynamic-shape machinery
+    # torch emits via ORT before converting to f16, so both precisions benefit.
+    optimize_onnx_graph(f32_path)
 
     if precision == "f32":
         final_path = f32_path
@@ -144,7 +166,7 @@ def build(input_path, output_dir, precision="f16", extra_options=None, opset=17)
         print(f"output: {o}")
 
     dtype = np.float16 if precision == "f16" else np.float32
-    sample = np.random.randn(2, 3, 224, 224).astype(dtype)
+    sample = np.random.randn(1, 3, 224, 224).astype(dtype)
     outputs = sess.run(None, {"clip_input": sample})
     print(
         f"  sanity run output 'has_nsfw_concepts': shape={outputs[0].shape}, "

@@ -337,12 +337,14 @@ def _build_encoder_graph(checkpoint_dir, dtype="f16"):
     )
     assert encoder_hidden_states is not None  # guaranteed by need_sum=True with a non-None skip
 
+    # batch is fixed at 1 across the whole pipeline (the transformer hardcodes batch=1), so
+    # pin it here too -- a static leading dim helps ORT's graph optimizations.
     graph_inputs = [
-        helper.make_tensor_value_info(input_ids_name, TensorProto.INT64, ["batch_size", "sequence_length"]),
-        helper.make_tensor_value_info(attn_mask_name, TensorProto.INT64, ["batch_size", "total_sequence_length"]),
+        helper.make_tensor_value_info(input_ids_name, TensorProto.INT64, [1, "sequence_length"]),
+        helper.make_tensor_value_info(attn_mask_name, TensorProto.INT64, [1, "total_sequence_length"]),
     ]
     graph_output = helper.make_tensor_value_info(
-        encoder_hidden_states, onnx_dtype, ["batch_size", "sequence_length", dims["hidden_size"]]
+        encoder_hidden_states, onnx_dtype, [1, "sequence_length", dims["hidden_size"]]
     )
     graph = helper.make_graph(gb.nodes, "zimage_text_encoder", graph_inputs, [graph_output], initializer=gb.initializers)
     onnx_model = helper.make_model(
