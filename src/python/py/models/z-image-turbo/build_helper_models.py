@@ -371,11 +371,13 @@ def build(input_path, output_dir, precision="f16", extra_options=None):
         ),
         ["noise_pred", "latents", "step_info"],
         ["latents_out"],
+        # batch is fixed at 1 across the whole pipeline (the transformer hardcodes batch=1);
+        # leave axis 0 out of dynamic_axes so it stays a static 1 (dummy inputs are batch=1).
         {
-            "noise_pred": {0: "batch", 2: "height", 3: "width"},
-            "latents": {0: "batch", 2: "height", 3: "width"},
+            "noise_pred": {2: "height", 3: "width"},
+            "latents": {2: "height", 3: "width"},
             "step_info": {},
-            "latents_out": {0: "batch", 2: "height", 3: "width"},
+            "latents_out": {2: "height", 3: "width"},
         },
         onnx_dir, precision, verify_scheduler_step,
     )
@@ -398,8 +400,8 @@ def build(input_path, output_dir, precision="f16", extra_options=None):
         (torch.randn(1, LATENT_CHANNELS, latent_h, latent_w),),
         ["latents"], ["scaled_latents"],
         {
-            "latents": {0: "batch", 2: "height", 3: "width"},
-            "scaled_latents": {0: "batch", 2: "height", 3: "width"},
+            "latents": {2: "height", 3: "width"},
+            "scaled_latents": {2: "height", 3: "width"},
         },
         onnx_dir, precision, verify_vae_pre_process,
     )
@@ -423,8 +425,8 @@ def build(input_path, output_dir, precision="f16", extra_options=None):
         (torch.randn(1, 3, height, width),),
         ["sample"], ["clip_input"],
         {
-            "sample": {0: "batch", 2: "height", 3: "width"},
-            "clip_input": {0: "batch"},
+            "sample": {2: "height", 3: "width"},
+            "clip_input": {},
         },
         onnx_dir, precision, verify_sc_prep,
     )
