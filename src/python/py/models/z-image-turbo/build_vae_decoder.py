@@ -6,51 +6,9 @@
 # Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # Portions of this file consist of AI generated content.
 # --------------------------------------------------------------------------
-"""Standalone exporter for the Z-Image-Turbo VAE decoder (`AutoencoderKL.decoder`).
 
-Self-contained port of ../builders/zimage_vae.py: depends on `Model` from the
-*public* `onnxruntime-genai` pip package (see requirements.txt) instead of
-this repo's own ../builders/base.py, so this file (+ its pip deps) is
-everything needed to run it -- no onnxruntime-genai source checkout required.
-Deliberately duplicates a few small helpers already in build_transformer.py
-(rather than importing from it) so each build_*.py stays independently
-runnable.
-
-This builds the VAE decoder ONNX graph directly from the PyTorch weights.
-
-Two GroupNorm flavours are supported, selected by `--extra_options fuse_group_norm=...`:
-
-  * `fuse_group_norm=false` (default): every diffusers GroupNorm is decomposed into
-    standard ONNX ops, all in NCHW with no Transposes:
-    `Reshape[0,G,-1] -> InstanceNormalization(scale=1,bias=0) -> Reshape(back)
-    -> Mul(gamma) -> Add(beta) [-> Sigmoid -> Mul]`. Residual adds are emitted as
-    plain `Add` nodes. The graph contains no `com.microsoft` contrib ops, so it runs
-    on any EP with an `InstanceNormalization` kernel (e.g. WebGPU today).
-
-  * `fuse_group_norm=true`: each GroupNorm is emitted as a single channels-last
-    `com.microsoft.GroupNorm` with the SiLU/swish activation fused in
-    (`activation=1`), and each residual-`Add`->norm seam is fused into one
-    `com.microsoft.SkipGroupNorm` (`S = X + skip`, `Y = GroupNorm(S)`). The 3
-    nearest-neighbour upsamplers then run `Resize` in NHWC (scales permuted
-    `[1,1,2,2]`->`[1,2,2,1]`) sandwiched in Transposes that cancel against the
-    neighbouring GroupNorm Transposes. Requires an onnxruntime build whose EP
-    implements those contrib ops.
-
-Common to both:
-
-  * The diffusers `output_scale_factor=1.0` residual division (a `Div` by 1.0) is
-    simply never emitted.
-
-  * The mid-block self-attention is emitted UNFUSED (MatMul/Softmax/MatMul),
-    matching the original float16 export bit-for-bit. It is deliberately NOT a
-    `com.microsoft.MultiHeadAttention`: this VAE's attention logits overflow
-    float16 (diffusers uses `force_upcast=true`), and the fused kernel turns that
-    overflow into NaN.
-
-Scope: decoder only (no encoder), dynamic batch and latent height/width, f16/f32
-only (matching the WebNN bundle's own unquantized `vae_decoder_model_f16.onnx`;
-int4/int8 mid-block quantization is architecturally possible via `make_matmul`
-but not exposed here -- pass a wider `-p` choice to `build()` if you need it).
+"""
+Standalone exporter for the Z-Image-Turbo VAE decoder.
 """
 
 import argparse
@@ -63,9 +21,6 @@ import onnx_ir as ir
 import torch
 from onnxruntime_genai.models.builders.base import Model
 
-# Maps the user-facing -p choice to the underlying `Model.onnx_dtype` setup.
-# No int4/int8 here (see module docstring); matches ../build_z_image_turbo.py's
-# `-m vae_decoder`, which mirrors the WebNN bundle's own unquantized decoder.
 PRECISION_CONFIGS = {
     "f16": {"builder_precision": "fp16"},
     "f32": {"builder_precision": "fp32"},
@@ -75,11 +30,9 @@ DEFAULT_OUTPUT_DIR = "z-image-turbo-onnx"
 
 
 # ---------------------------------------------------------------------------
-# Vendored from onnxruntime_genai.models.builder (see build_transformer.py for
-# why these are copied rather than imported).
+# Vendored from onnxruntime_genai.models.builder.
 # ---------------------------------------------------------------------------
 def set_io_dtype(precision, execution_provider, extra_options) -> ir.DataType:
-    """Set the input/output precision of the ONNX model based on the provided precision and execution provider."""
     cpu_quant = precision in {"int4", "int8"} and execution_provider == "cpu"
     fp32_webgpu = execution_provider == "webgpu" and extra_options.get("use_webgpu_fp32", False)
     bf16_cuda = precision == "int4" and execution_provider in {"cuda", "trt-rtx"} and extra_options.get("use_cuda_bf16", False)
@@ -92,7 +45,6 @@ def set_io_dtype(precision, execution_provider, extra_options) -> ir.DataType:
 
 
 def set_onnx_dtype(precision: str, extra_options: dict[str, Any]) -> ir.DataType:
-    """Set the ONNX model's internal precision based on the provided precision and extra options."""
     if precision == "int4":
         return ir.DataType.INT4 if extra_options.get("is_symmetric", True) else ir.DataType.UINT4
     if precision == "int8":
@@ -106,13 +58,6 @@ def set_onnx_dtype(precision: str, extra_options: dict[str, Any]) -> ir.DataType
 
 
 def load_diffusers_config(input_path):
-    """Load a diffusers-style `config.json` (e.g. Z-Image-Turbo's `vae/config.json`).
-
-    Not `transformers`-AutoConfig loadable (`_class_name`, not `architectures`), and
-    there is no tokenizer to load for it. `Model.__init__` relies on `_name_or_path`
-    for weight loading, so stamp that on too (mirroring what `AutoConfig.from_pretrained`
-    normally does).
-    """
     config_path = os.path.join(input_path, "config.json")
     with open(config_path) as f:
         raw_config = json.load(f)
@@ -121,7 +66,6 @@ def load_diffusers_config(input_path):
 
 
 def parse_extra_options(pairs):
-    """Parse `key=value` strings (as passed via `--extra_options`) into a dict."""
     extra_options = {}
     for kv_str in pairs or []:
         key, _, value = kv_str.partition("=")
@@ -163,9 +107,6 @@ class ZImageVAEDecoderModel(Model):
         self.norm_num_groups = int(config.norm_num_groups)
         # False (default): decomposed standard-ONNX GroupNorm; True: com.microsoft GroupNorm/SkipGroupNorm.
         self.fuse_group_norm = bool(extra_options.get("fuse_group_norm", False))
-        # Graph I/O, weights and internal compute all follow `io_dtype` (float16 for
-        # `-p fp16` on WebGPU, float32 with `-p fp32`/`use_webgpu_fp32`), matching the
-        # Z-Image transformer export.
         self._io_dtype = self.io_dtype
 
     # ------------------------------------------------------------------
@@ -209,7 +150,6 @@ class ZImageVAEDecoderModel(Model):
         return node_name[1:].replace("/", ".") + suffix
 
     def _const(self, dtype, value):
-        """Return the name of an inline `Constant` node holding `value`."""
         return f"/model/constants/{self.to_str_dtype(dtype)}/{value}"
 
     def _transpose(self, name, root_input, perm):
@@ -229,7 +169,6 @@ class ZImageVAEDecoderModel(Model):
         return f"{name}/output_0"
 
     def _conv(self, name, root_input, conv):
-        """Emit an `nn.Conv2d` (NCHW). Weight/bias initializers derive from the node name."""
         weight = self._init_name(name, ".weight")
         self.make_initializer(conv.weight, weight, to=self._io_dtype)
         inputs = [root_input, weight]
@@ -262,17 +201,6 @@ class ZImageVAEDecoderModel(Model):
     # GroupNorm (fused contrib op or decomposed standard ops)
     # ------------------------------------------------------------------
     def _group_norm(self, name, source, gnmod, swish, expose_skip=True):
-        """Emit a GroupNorm (optionally with a folded residual add and a fused SiLU).
-
-        `source` is either a materialized NCHW tensor name (plain GroupNorm) or a
-        `(conv_branch, skip_branch)` pair whose sum is the norm input. Returns
-        `(y_nchw, s_nchw)`; `s_nchw` is the residual sum `X + skip` (None for the
-        plain case, or when `expose_skip=False`).
-
-        Dispatches on `self.fuse_group_norm`: the fused path emits channels-last
-        `com.microsoft.GroupNorm`/`SkipGroupNorm`; the default path stays in NCHW
-        and uses only standard ONNX ops.
-        """
         if self.fuse_group_norm:
             return self._group_norm_fused(name, source, gnmod, swish, expose_skip)
 
@@ -287,17 +215,6 @@ class ZImageVAEDecoderModel(Model):
         return y, (s if expose_skip else None)
 
     def _group_norm_decomposed(self, name, x_nchw, gnmod, swish):
-        """Standard-ONNX GroupNorm in NCHW (the PyTorch exporter's decomposition):
-
-            Reshape[0,G,-1] -> InstanceNormalization(scale=1, bias=0)
-            -> Reshape(input shape) -> Mul(gamma[C,1,1]) -> Add(beta[C,1,1])
-            [-> Sigmoid -> Mul]   (SiLU when `swish`)
-
-        `InstanceNormalization` normalizes each `[G]` row over `C/G*H*W`, which is
-        exactly GroupNorm's statistics; its per-group affine is the identity so the
-        real gamma/beta apply per-channel afterwards. Shapes stay dynamic in
-        batch/H/W via `Reshape`'s dim-copy (`0`) and a `Shape` node for the way back.
-        """
         groups = int(gnmod.num_groups)
         channels = int(gnmod.num_channels)
         eps = float(gnmod.eps)
@@ -330,9 +247,6 @@ class ZImageVAEDecoderModel(Model):
         return y
 
     def _group_norm_fused(self, name, source, gnmod, swish, expose_skip):
-        """Channels-last `com.microsoft.GroupNorm`/`SkipGroupNorm` bracketed by
-        NCHW<->NHWC Transposes. Same contract as `_group_norm`.
-        """
         gamma = self._init_name(name, ".weight")
         beta = self._init_name(name, ".bias")
         self.make_initializer(gnmod.weight, gamma, to=self._io_dtype)
@@ -377,10 +291,6 @@ class ZImageVAEDecoderModel(Model):
     # ResNet block
     # ------------------------------------------------------------------
     def _resnet(self, name, source, resnet):
-        """Emit a diffusers ResnetBlock2D. Returns a *deferred* `(conv2_out, residual_base)`
-        pair: the final residual add is not emitted here so the consumer can either fold it
-        into its own SkipGroupNorm (residual->norm seam) or materialize it with `_add`.
-        """
         y, s = self._group_norm(f"{name}/norm1", source, resnet.norm1, swish=True, expose_skip=True)
         if s is not None:
             # SkipGroupNorm case: identity shortcut, residual base is the fused sum S.
@@ -399,13 +309,9 @@ class ZImageVAEDecoderModel(Model):
     # Mid-block self-attention (unfused, single-head)
     # ------------------------------------------------------------------
     def _mid_attention(self, name, x_nchw, attn):
-        """Single-head spatial self-attention, emitted UNFUSED (MatMul -> Softmax -> MatMul)."""
         assert attn.heads == 1, f"expected single-head VAE attention, got heads={attn.heads}"
-        # group_norm (plain, no activation), NCHW -> channels-last and back.
         gn, _ = self._group_norm(f"{name}/group_norm", x_nchw, attn.group_norm, swish=False)
 
-        # [N, C, H, W] -> [N, C, H*W] -> [N, H*W, C]. The leading 0 is ONNX Reshape's
-        # "copy this dim from the input" (allowzero=0), keeping batch dynamic.
         to_seq_shape = self._const(ir.DataType.INT64, [0, self.mid_channels, -1])
         flat = self._reshape(f"{name}/flatten", gn, to_seq_shape)
         seq = self._transpose(f"{name}/to_seq", flat, [0, 2, 1])
@@ -414,35 +320,31 @@ class ZImageVAEDecoderModel(Model):
         k = self._linear(f"{name}/to_k", seq, attn.to_k)
         v = self._linear(f"{name}/to_v", seq, attn.to_v)
 
-        # scores = softmax(Q @ K^T / sqrt(head_size)) @ V
+        scale = self._const(self._io_dtype, self.mid_channels ** -0.25)
+        q = self._mul(f"{name}/q_scale", [q, scale])
         kt = self._transpose(f"{name}/kT", k, [0, 2, 1])  # [1, C, H*W]
+        kt = self._mul(f"{name}/k_scale", [kt, scale])
         scores = f"{name}/scores/output_0"
         self.make_node("MatMul", inputs=[q, kt], outputs=[scores], name=f"{name}/scores")
         self.make_value(scores, self._io_dtype)
-        scaled = self._mul(f"{name}/scale", [scores, self._const(self._io_dtype, self.mid_channels ** -0.5)])
         probs = f"{name}/softmax/output_0"
-        self.make_node("Softmax", inputs=[scaled], outputs=[probs], name=f"{name}/softmax", axis=-1)
+        self.make_node("Softmax", inputs=[scores], outputs=[probs], name=f"{name}/softmax", axis=-1)
         self.make_value(probs, self._io_dtype)
         ctx = f"{name}/context/output_0"
         self.make_node("MatMul", inputs=[probs, v], outputs=[ctx], name=f"{name}/context")
         self.make_value(ctx, self._io_dtype)
         attn_out = self._linear(f"{name}/to_out.0", ctx, attn.to_out[0])
 
-        # [1, H*W, C] -> [1, C, H*W] -> [1, C, H, W] (restore spatial dims from the input)
         back_seq = self._transpose(f"{name}/from_seq", attn_out, [0, 2, 1])
         self.make_shape(f"{name}/in_shape", x_nchw, shape=[4])
         spatial = self._reshape(f"{name}/unflatten", back_seq, f"{name}/in_shape/output_0")
 
-        # residual connection (output_scale_factor / rescale = 1.0, so no division)
         return self._add(f"{name}/Add", [spatial, x_nchw])
 
     # ------------------------------------------------------------------
     # Upsampler (nearest 2x, then conv)
     # ------------------------------------------------------------------
     def _upsample(self, name, x_nchw, conv):
-        """Nearest 2x `Resize` then conv. In the fused flavour the Resize runs in NHWC so its
-        Transposes cancel against the neighbouring GroupNorm ones; otherwise it stays NCHW.
-        """
         if self.fuse_group_norm:
             x = self._transpose(f"{name}/pre_t", x_nchw, [0, 2, 3, 1])
             scales = self._const(ir.DataType.FLOAT, [1.0, 2.0, 2.0, 1.0])
@@ -477,7 +379,6 @@ class ZImageVAEDecoderModel(Model):
         r0 = self._resnet("/decoder/mid_block/resnets.0", x, mid.resnets[0])
         x = self._add("/decoder/mid_block/resnets.0/Add", list(r0))  # feeds attention (non-norm)
         x = self._mid_attention("/decoder/mid_block/attentions.0", x, mid.attentions[0])
-        # resnet1's output feeds up_blocks.0.resnets.0.norm1 (a SkipGroupNorm seam): defer.
         source = self._resnet("/decoder/mid_block/resnets.1", x, mid.resnets[1])
 
         # --- up blocks ---
@@ -486,15 +387,12 @@ class ZImageVAEDecoderModel(Model):
             for rj in range(n_res):
                 r = self._resnet(f"/decoder/up_blocks.{bi}/resnets.{rj}", source, up.resnets[rj])
                 if rj < n_res - 1:
-                    # next resnet's norm1 folds this residual add (SkipGroupNorm seam).
                     source = r
                 elif getattr(up, "upsamplers", None):
-                    # last resnet before an upsampler: materialize, then Resize+conv.
                     x = self._add(f"/decoder/up_blocks.{bi}/resnets.{rj}/Add", list(r))
                     x = self._upsample(f"/decoder/up_blocks.{bi}/upsamplers.0", x, up.upsamplers[0].conv)
-                    source = x  # feeds next block's resnets.0.norm1 (plain GroupNorm, fed by a Conv)
+                    source = x
                 else:
-                    # last block, no upsampler: conv_norm_out folds this residual add.
                     source = r
 
         # --- conv_norm_out (SkipGroupNorm, swish) -> conv_out ---
@@ -511,7 +409,6 @@ class ZImageVAEDecoderModel(Model):
     # Save (single self-contained .onnx file)
     # ------------------------------------------------------------------
     def save_model(self, out_dir):
-        """Save as ONE self-contained `.onnx` file."""
         print(f"Saving ONNX model in {out_dir}")
         already_quantized_in_qdq_format = self.quant_type is not None and self.quant_attrs["use_qdq"]
         if self.onnx_dtype in {ir.DataType.INT4, ir.DataType.UINT4, ir.DataType.INT8, ir.DataType.UINT8} and not already_quantized_in_qdq_format:
@@ -523,12 +420,12 @@ class ZImageVAEDecoderModel(Model):
 
         out_path = os.path.join(out_dir, self.filename)
         data_path = out_path + ".data"
-        for stale in (out_path, data_path):  # remove any prior two-file output too
+        for stale in (out_path, data_path):
             if os.path.exists(stale):
                 print(f"Overwriting {stale}")
                 os.remove(stale)
 
-        ir.save(model, out_path)  # inline weights -> single file
+        ir.save(model, out_path)
 
         if os.path.isdir(self.cache_dir) and not os.listdir(self.cache_dir):
             os.rmdir(self.cache_dir)
@@ -553,8 +450,6 @@ def build(input_path, output_dir, precision="f16", extra_options=None):
 
     config = load_diffusers_config(input_path)
 
-    # All .onnx (+ external-data) output goes under a shared `onnx/` subdir of
-    # `output_dir`, so multiple components can later land side by side in one bundle.
     onnx_dir = os.path.join(output_dir, "onnx")
     os.makedirs(onnx_dir, exist_ok=True)
     cache_dir = os.path.join(output_dir, "cache")
