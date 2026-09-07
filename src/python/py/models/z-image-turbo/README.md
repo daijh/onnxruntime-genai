@@ -2,22 +2,23 @@
 
 Self-contained experiment: export pieces of the
 [Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) text-to-image pipeline to
-plain ONNX graphs. Unlike `../builders/zimage*.py`, these `build_*.py` scripts depend only on
-the *public* `onnxruntime-genai` pip package (not this repo's own `../builders/base.py` source
-tree), so each one runs standalone with just `pip install -r requirements.txt` -- no
+plain ONNX graphs. Unlike `../builders/zimage*.py`, these `models/build_*.py` scripts depend
+only on the *public* `onnxruntime-genai` pip package (not this repo's own `../builders/base.py`
+source tree), so each one runs standalone with just `pip install -r requirements.txt` -- no
 onnxruntime-genai checkout required.
 
-`export_models.py` is the main entry point; each component also has its own standalone CLI.
+`export_models.py` (at the top level) is the main entry point; each component's
+`models/build_*.py` also has its own standalone CLI.
 
 ## Status
 
 | Component | Script | Status |
 |---|---|---|
-| Transformer trunk | `build_transformer.py` | done |
-| Text encoder (Qwen3) | `build_text_encoder.py` | done |
-| VAE decoder | `build_vae_decoder.py` | done |
-| Helper models (scheduler_step / vae_pre_process / sc_prep) | `build_helper_models.py` | done |
-| Safety checker | `build_safety_checker.py` | done (needs its own separate checkpoint, see below) |
+| Transformer trunk | `models/build_transformer.py` | done |
+| Text encoder (Qwen3) | `models/build_text_encoder.py` | done |
+| VAE decoder | `models/build_vae_decoder.py` | done |
+| Helper models (scheduler_step / vae_pre_process / sc_prep) | `models/build_helper_models.py` | done |
+| Safety checker | `models/build_safety_checker.py` | done (needs its own separate checkpoint, see below) |
 
 Every component is ported -- `export_models.py -m all` (or no `-m`) builds the full pipeline
 in one bundle directory (safety_checker needs `--safety_checker_checkpoint`, see below; it's
@@ -73,14 +74,14 @@ python export_models.py path_to_local_folder -m safety_checker --safety_checker_
 `-m all` includes it too if `--safety_checker_checkpoint` is given; otherwise it's skipped
 (with a message) so `-m all` still works without it.
 
-Each `build_*.py` also works standalone, e.g.:
+Each `models/build_*.py` also works standalone, e.g.:
 
 ```bash
-python build_transformer.py path_to_local_folder/transformer -o my_output_dir -p f16_int4_quant
-python build_text_encoder.py path_to_local_folder/text_encoder -o my_output_dir -p f16_int4_quant
-python build_vae_decoder.py path_to_local_folder/vae -o my_output_dir -p f16
-python build_helper_models.py -o my_output_dir -p f16
-python build_safety_checker.py path_to_safety_checker_folder -o my_output_dir -p f16
+python models/build_transformer.py path_to_local_folder/transformer -o my_output_dir -p f16_int4_quant
+python models/build_text_encoder.py path_to_local_folder/text_encoder -o my_output_dir -p f16_int4_quant
+python models/build_vae_decoder.py path_to_local_folder/vae -o my_output_dir -p f16
+python models/build_helper_models.py -o my_output_dir -p f16
+python models/build_safety_checker.py path_to_safety_checker_folder -o my_output_dir -p f16
 ```
 
 All `.onnx` output (+ external data) lands under `<output_dir>/onnx/`, so multiple components
