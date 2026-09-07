@@ -33,6 +33,14 @@ import re
 import onnx
 import onnx_ir as ir
 
+# External-data layout shared by every Z-Image-Turbo exporter. Small (<= 1 MiB) initializers
+# stay inline in the `.onnx` so ONNX Runtime graph transformations keep cheap access to small
+# constants; larger weights go to size-capped `.onnx_data[_N]` shards. The shard cap sits just
+# under 2 GiB: each shard loads into a single JS ArrayBuffer in the browser, and ArrayBuffer has
+# a hard 2 GiB (2**31 byte) ceiling, so 1.9 GiB leaves headroom to avoid that bottleneck.
+INLINE_SIZE_THRESHOLD_BYTES = 1 * 1024**2
+MAX_SHARD_SIZE_BYTES = int(1.9 * 1024**3)
+
 # onnx_ir shard filename convention: "<stem>-000i-of-000N<ext>" (i, N 1-indexed).
 _SHARD_RE = re.compile(r"-(\d{5})-of-(\d{5})")
 

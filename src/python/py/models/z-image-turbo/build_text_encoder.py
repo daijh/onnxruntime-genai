@@ -51,14 +51,13 @@ from onnx import TensorProto, helper, numpy_helper
 from onnxruntime.quantization.matmul_nbits_quantizer import MatMulNBitsQuantizer, QuantFormat
 from transformers import AutoModelForCausalLM
 
-from external_data_utils import save_ir_model_sharded
+from external_data_utils import (
+    INLINE_SIZE_THRESHOLD_BYTES,
+    MAX_SHARD_SIZE_BYTES,
+    save_ir_model_sharded,
+)
 
 DEFAULT_OUTPUT_DIR = "z-image-turbo-onnx"
-
-# External-data layout: keep small (<= 1 MiB) weights inline for ORT graph
-# transformations; shard the larger weights into `<= 2 GiB` `.onnx_data[_N]` files.
-INLINE_SIZE_THRESHOLD_BYTES = 1 * 1024**2
-MAX_SHARD_SIZE_BYTES = 2 * 1024**3
 
 # Filename suffix per precision, matching ../build_z_image_turbo.py's TEXT_ENCODER_PRECISIONS
 # and the WebNN bundle's own naming convention (text_encoder_model_q4f16.onnx).
@@ -362,7 +361,7 @@ def export_qwen3_text_encoder(checkpoint_dir, output_onnx_path, quantize, dtype=
     out_dir = os.path.dirname(os.path.abspath(output_onnx_path)) or "."
     os.makedirs(out_dir, exist_ok=True)
     # Same save path as the transformer: small (<= 1 MiB) weights inline for ORT graph
-    # transformations, larger weights sharded into `<= 2 GiB` `.onnx_data[_N]` files.
+    # transformations, larger weights sharded into `< 1.9 GiB` `.onnx_data[_N]` files.
     save_ir_model_sharded(
         ir.from_proto(onnx_model), out_dir, os.path.basename(output_onnx_path),
         size_threshold_bytes=INLINE_SIZE_THRESHOLD_BYTES,

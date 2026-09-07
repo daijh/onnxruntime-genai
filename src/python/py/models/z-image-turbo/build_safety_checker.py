@@ -34,6 +34,8 @@ import argparse
 import os
 
 import numpy as np
+import onnx
+import onnx_ir as ir
 import onnxruntime as ort
 import torch
 import torch.nn as nn
@@ -43,6 +45,11 @@ from diffusers.pipelines.stable_diffusion.safety_checker import (
 )
 
 from build_helper_models import convert_to_f16
+from external_data_utils import (
+    INLINE_SIZE_THRESHOLD_BYTES,
+    MAX_SHARD_SIZE_BYTES,
+    save_ir_model_sharded,
+)
 
 DEFAULT_OUTPUT_DIR = "z-image-turbo-onnx"
 
@@ -150,14 +157,28 @@ def build(input_path, output_dir, precision="f16", extra_options=None, opset=17)
     # torch emits via ORT before converting to f16, so both precisions benefit.
     optimize_onnx_graph(f32_path)
 
+    # Load the final graph as a proto, then save it with small weights inline and the large CLIP
+    # weights in sharded external data -- same layout as the transformer/text encoder, so each
+    # `.onnx_data*` shard stays under the browser's 2 GiB ArrayBuffer ceiling (see
+    # external_data_utils.MAX_SHARD_SIZE_BYTES).
     if precision == "f32":
-        final_path = f32_path
+        final_name = "safety_checker_model_f32.onnx"
+        proto = onnx.load(f32_path)
     else:
-        final_path = os.path.join(onnx_dir, "safety_checker_model_f16.onnx")
-        convert_to_f16(f32_path, final_path)
-        os.remove(f32_path)
-        print(f"  (removed intermediate {f32_path}; only f16 was requested)")
-        print(f"  wrote {final_path} ({os.path.getsize(final_path) / (1024 * 1024):.1f} MB)")
+        final_name = "safety_checker_model_f16.onnx"
+        f16_tmp = os.path.join(onnx_dir, "safety_checker_model_f16_tmp.onnx")
+        convert_to_f16(f32_path, f16_tmp)
+        proto = onnx.load(f16_tmp)
+        os.remove(f16_tmp)
+    os.remove(f32_path)
+
+    save_ir_model_sharded(
+        ir.from_proto(proto), onnx_dir, final_name,
+        size_threshold_bytes=INLINE_SIZE_THRESHOLD_BYTES,
+        max_shard_size_bytes=MAX_SHARD_SIZE_BYTES,
+    )
+    final_path = os.path.join(onnx_dir, final_name)
+    print(f"  wrote {final_path} (+ sharded external data)")
 
     sess = ort.InferenceSession(final_path, providers=["CPUExecutionProvider"])
     for i in sess.get_inputs():
