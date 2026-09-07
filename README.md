@@ -108,7 +108,7 @@ weights only — it never touches the tokenizer) with `onnx.helper`, building on
 norm, and LM head are never built at all, not built-then-stripped):
 
 - taps the residual stream entering the last decoder layer's input norm (equivalent to
-  HuggingFace's `hidden_states[-2]`) as the output, exposed as `encoder_hidden_state` of shape
+  HuggingFace's `hidden_states[-2]`) as the output, exposed as `encoder_hidden_states` of shape
   `[1, seq, 2560]`, and
 - takes only `input_ids` and `attention_mask` as graph inputs — there's no KV cache (a
   graph-capture-style mask-reformatting subgraph derives `seqlens_k`/`total_seq_len` from
@@ -318,7 +318,7 @@ WebNN transformer's 5D) and no attention mask/padding (`encoder_hidden_states` i
 multiple of 32 tokens by repeating the last real token's embedding). `--text_encoder` swaps in a
 `build_z_image_turbo.py -m text_encoder` encoder in place of the bundle's
 `onnx/text_encoder_model_q4f16.onnx`; it's a drop-in (same `input_ids`/`attention_mask` inputs,
-single float16 `encoder_hidden_state` output, auto-detected at load). `--vae_decoder` swaps in a
+single float16 `encoder_hidden_states` output, auto-detected at load). `--vae_decoder` swaps in a
 `builders/zimage_vae.py` export (same `latent_sample` -> `sample` interface as the bundle's
 `onnx/vae_decoder_model_f16.onnx`; its float16/float32 I/O dtype is read from the model). Every
 flag is optional — omit all to run the WebNN bundle end-to-end as a baseline, or pass only one to
