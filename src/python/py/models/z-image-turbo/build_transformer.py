@@ -42,6 +42,14 @@ import onnx_ir as ir
 import torch
 from onnxruntime_genai.models.builders.base import Model
 
+from external_data_utils import save_ir_model_sharded
+
+# External-data layout: keep small (<= 1 MiB) weights inline in the `.onnx` so
+# ONNX Runtime graph transformations retain cheap access to small constants;
+# shard the larger weights into `<= 2 GiB` `.onnx_data[_N]` files.
+INLINE_SIZE_THRESHOLD_BYTES = 1 * 1024**2
+MAX_SHARD_SIZE_BYTES = 2 * 1024**3
+
 # Maps the user-facing -p choice to the underlying `Model.onnx_dtype`/quantization
 # setup and whether MatMulNBits int4 weight quantization should be applied.
 PRECISION_CONFIGS = {
@@ -228,6 +236,51 @@ class ZImageTransformerModel(Model):
         return model
 
     # ------------------------------------------------------------------
+    # Saving
+    # ------------------------------------------------------------------
+    def save_model(self, out_dir):
+        """Save with small weights inline and sharded external data.
+
+        Overrides `Model.save_model`, which forces every weight external into a
+        single `<name>.onnx.data` (`size_threshold_bytes=0`, no sharding). The
+        int4-materialization and topological-sort steps are mirrored verbatim
+        from the base so quantized builds are unchanged; only the final write is
+        routed through `save_ir_model_sharded` (inline <= 1 MiB, shards <= 2 GiB,
+        `<name>.onnx_data[_N]` naming).
+        """
+        from tqdm import tqdm
+
+        print(f"Saving ONNX model in {out_dir}")
+        already_quantized_in_qdq_format = self.quant_type is not None and self.quant_attrs["use_qdq"]
+        if self.onnx_dtype in {ir.DataType.INT4, ir.DataType.UINT4, ir.DataType.INT8, ir.DataType.UINT8} and not already_quantized_in_qdq_format:
+            model = self.to_nbits()
+        else:
+            model = self.model
+        model.graph.sort()
+
+        with tqdm() as pbar:
+            total_set = False
+
+            def callback(tensor, metadata):
+                nonlocal total_set
+                if not total_set:
+                    pbar.total = metadata.total
+                    total_set = True
+                pbar.update()
+                pbar.set_description(f"Saving {tensor.name} ({tensor.dtype.short_name()}, {tensor.shape})")
+
+            save_ir_model_sharded(
+                model, out_dir, self.filename,
+                size_threshold_bytes=INLINE_SIZE_THRESHOLD_BYTES,
+                max_shard_size_bytes=MAX_SHARD_SIZE_BYTES,
+                callback=callback,
+            )
+
+        # Delete temporary cache dir if empty (mirrors base.Model.save_model).
+        if not os.listdir(self.cache_dir):
+            os.rmdir(self.cache_dir)
+
+    # ------------------------------------------------------------------
     # Inputs / outputs
     # ------------------------------------------------------------------
     def make_inputs_and_outputs(self):
@@ -277,7 +330,12 @@ class ZImageTransformerModel(Model):
         if seq_dim is None:
             seq_dim = shape[1] if len(shape) == 3 and isinstance(shape[1], str) else f"dim1_of_{name}"
         if exclude_from_quant:
-            linear.exclude_from_quantization = True
+            # genai 0.15.2 defers int4 quantization to save time (`to_nbits`) and honors ONLY
+            # `quant_attrs["nodes_to_exclude"]` (a list of node names) -- the older
+            # `linear.exclude_from_quantization` attribute is no longer read by any code path.
+            # The float `MatMul` emitted below is named `name` (see base `make_matmul_float`),
+            # so register that node name to keep this weight full precision.
+            self.quant_attrs["nodes_to_exclude"].append(name)
         self.make_matmul(linear, name, root_input, seq_dim=seq_dim)
         output = f"{name}/output_0"
         # Re-stamp the declared shape: `make_matmul` assumes the generic 3D
@@ -906,7 +964,11 @@ def build(input_path, output_dir, precision="f16_int4_quant", extra_options=None
     if precision_config["int4_quant"]:
         extra_options.setdefault("block_size", 32)
         extra_options.setdefault("accuracy_level", 4)
-        extra_options.setdefault("op_types_to_quantize", ("MatMul", "Gather"))
+        # Quantize `MatMul` only. Including `Gather` would int4-quantize the RoPE frequency
+        # tables (`model.rope.axis_*_freqs`, read by GatherBlockQuantized) -- the only
+        # initializer-backed Gathers in this diffusion graph -- corrupting positional
+        # encoding and degrading image quality. Keep them full precision.
+        extra_options.setdefault("op_types_to_quantize", ("MatMul",))
         if precision == "f32_int4_quant":
             extra_options.setdefault("use_webgpu_fp32", True)
 

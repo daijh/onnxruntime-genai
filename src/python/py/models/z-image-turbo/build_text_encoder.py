@@ -18,7 +18,7 @@ first place -- it builds the graph directly with `onnx.helper` -- so this file o
 The Z-Image-Turbo pipeline drives its DiT transformer with caption features taken
 from a Qwen3 language model. Rather than a full autoregressive decoder, it needs a
 single-forward encoder that maps `input_ids`/`attention_mask` to one hidden-state
-tensor (`encoder_hidden_state`): the residual stream entering the model's last
+tensor (`encoder_hidden_states`): the residual stream entering the model's last
 decoder layer (equivalently, HuggingFace's `output_hidden_states=True`
 `hidden_states[-2]`).
 
@@ -45,12 +45,20 @@ import os
 
 import numpy as np
 import onnx
+import onnx_ir as ir
 import torch
 from onnx import TensorProto, helper, numpy_helper
 from onnxruntime.quantization.matmul_nbits_quantizer import MatMulNBitsQuantizer, QuantFormat
 from transformers import AutoModelForCausalLM
 
+from external_data_utils import save_ir_model_sharded
+
 DEFAULT_OUTPUT_DIR = "z-image-turbo-onnx"
+
+# External-data layout: keep small (<= 1 MiB) weights inline for ORT graph
+# transformations; shard the larger weights into `<= 2 GiB` `.onnx_data[_N]` files.
+INLINE_SIZE_THRESHOLD_BYTES = 1 * 1024**2
+MAX_SHARD_SIZE_BYTES = 2 * 1024**3
 
 # Filename suffix per precision, matching ../build_z_image_turbo.py's TEXT_ENCODER_PRECISIONS
 # and the WebNN bundle's own naming convention (text_encoder_model_q4f16.onnx).
@@ -146,7 +154,7 @@ def _simplified_layernorm(gb, x, weight_name, eps, name_prefix, skip=None, need_
     # skip=<name> -> SkipSimplifiedLayerNormalization (com.microsoft domain): computes
     # sum = x + skip, then Y = norm(sum). need_sum=True also returns the sum (4th output);
     # the sum feeds the *next* layer's fused input-norm, or -- for the very last node this
-    # module builds -- becomes `encoder_hidden_state` directly (via sum_output_name, so the
+    # module builds -- becomes `encoder_hidden_states` directly (via sum_output_name, so the
     # graph's final output tensor is produced directly by this node, no extra rename op).
     inputs = [x, weight_name] if skip is None else [x, skip, weight_name]
     op_type = ("Skip" if skip is not None else "") + "SimplifiedLayerNormalization"
@@ -193,7 +201,7 @@ def _build_decoder_layer(gb, layer_id, layer, root_residual, input_ln_skip, dims
     Returns (resid_before_mlp, mlp_output) -- both needed to build the next layer, and (for
     the last layer this module builds) resid_before_mlp/mlp_output together are what the
     caller feeds into one more `_simplified_layernorm(..., skip=mlp_output, need_sum=True)`
-    call (using the *next* layer's input_layernorm weight) to produce `encoder_hidden_state`.
+    call (using the *next* layer's input_layernorm weight) to produce `encoder_hidden_states`.
     """
     num_attn_heads, num_kv_heads = dims["num_attn_heads"], dims["num_kv_heads"]
     head_size, eps = dims["head_size"], dims["rms_norm_eps"]
@@ -323,18 +331,18 @@ def _build_encoder_graph(checkpoint_dir, dtype="f16"):
         f"model.layers.{tap_id}.input_layernorm.weight",
         layers[tap_id].input_layernorm.weight.detach().to(torch_dtype).numpy(),
     )
-    _, encoder_hidden_state = _simplified_layernorm(
+    _, encoder_hidden_states = _simplified_layernorm(
         gb, root_residual, tap_ln_w, dims["rms_norm_eps"], f"layer{tap_id}/input_layernorm",
-        skip=input_ln_skip, need_sum=True, sum_output_name="encoder_hidden_state",
+        skip=input_ln_skip, need_sum=True, sum_output_name="encoder_hidden_states",
     )
-    assert encoder_hidden_state is not None  # guaranteed by need_sum=True with a non-None skip
+    assert encoder_hidden_states is not None  # guaranteed by need_sum=True with a non-None skip
 
     graph_inputs = [
         helper.make_tensor_value_info(input_ids_name, TensorProto.INT64, ["batch_size", "sequence_length"]),
         helper.make_tensor_value_info(attn_mask_name, TensorProto.INT64, ["batch_size", "total_sequence_length"]),
     ]
     graph_output = helper.make_tensor_value_info(
-        encoder_hidden_state, onnx_dtype, ["batch_size", "sequence_length", dims["hidden_size"]]
+        encoder_hidden_states, onnx_dtype, ["batch_size", "sequence_length", dims["hidden_size"]]
     )
     graph = helper.make_graph(gb.nodes, "zimage_text_encoder", graph_inputs, [graph_output], initializer=gb.initializers)
     onnx_model = helper.make_model(
@@ -344,18 +352,19 @@ def _build_encoder_graph(checkpoint_dir, dtype="f16"):
     return onnx_model
 
 
-def export_qwen3_text_encoder(checkpoint_dir, output_onnx_path, external_data_name, quantize, dtype="f16"):
+def export_qwen3_text_encoder(checkpoint_dir, output_onnx_path, quantize, dtype="f16"):
     onnx_model = _build_encoder_graph(checkpoint_dir, dtype=dtype)
     if quantize:
         onnx_model = _quantize_int4(onnx_model)
 
-    os.makedirs(os.path.dirname(os.path.abspath(output_onnx_path)) or ".", exist_ok=True)
-    data_path = os.path.join(os.path.dirname(os.path.abspath(output_onnx_path)), external_data_name)
-    if os.path.exists(data_path):
-        os.remove(data_path)
-    onnx.save_model(
-        onnx_model, output_onnx_path, save_as_external_data=True, all_tensors_to_one_file=True,
-        location=external_data_name, size_threshold=1024 * 1024, convert_attribute=False,
+    out_dir = os.path.dirname(os.path.abspath(output_onnx_path)) or "."
+    os.makedirs(out_dir, exist_ok=True)
+    # Same save path as the transformer: small (<= 1 MiB) weights inline for ORT graph
+    # transformations, larger weights sharded into `<= 2 GiB` `.onnx_data[_N]` files.
+    save_ir_model_sharded(
+        ir.from_proto(onnx_model), out_dir, os.path.basename(output_onnx_path),
+        size_threshold_bytes=INLINE_SIZE_THRESHOLD_BYTES,
+        max_shard_size_bytes=MAX_SHARD_SIZE_BYTES,
     )
     print(f"Saved text encoder: {output_onnx_path}")
     return output_onnx_path
@@ -372,8 +381,7 @@ def build(input_path, output_dir, precision="f16_int4_quant", extra_options=None
     suffix = config["suffix"]
     output_onnx = os.path.join(onnx_dir, f"text_encoder_model_{suffix}.onnx")
     export_qwen3_text_encoder(
-        input_path, output_onnx, f"text_encoder_model_{suffix}.onnx.data",
-        quantize=config["quantize"], dtype=config["dtype"],
+        input_path, output_onnx, quantize=config["quantize"], dtype=config["dtype"],
     )
     return onnx_dir
 

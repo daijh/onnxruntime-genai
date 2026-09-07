@@ -359,7 +359,7 @@ class ZImagePipeline:
 
         # --text_encoder: swap in the onnxruntime-genai-built Qwen3 text encoder
         # (build_z_image_turbo.py -m text_encoder) instead of the bundled WebNN one. It's a
-        # drop-in: same `input_ids`/`attention_mask` inputs and a single `encoder_hidden_state`
+        # drop-in: same `input_ids`/`attention_mask` inputs and a single `encoder_hidden_states`
         # output (float16, auto-detected in initialize_text_encoder / used for model_dtype_).
         self.using_dev_text_encoder_ = bool(dev_text_encoder_path)
         if self.using_dev_text_encoder_:

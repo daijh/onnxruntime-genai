@@ -8,7 +8,7 @@
 The Z-Image-Turbo pipeline drives its DiT transformer with caption features taken
 from a Qwen3 language model. Rather than a full autoregressive decoder, it needs a
 single-forward encoder that maps `input_ids`/`attention_mask` to one hidden-state
-tensor (`encoder_hidden_state`): the residual stream entering the model's last
+tensor (`encoder_hidden_states`): the residual stream entering the model's last
 decoder layer (equivalently, HuggingFace's `output_hidden_states=True`
 `hidden_states[-2]`).
 
@@ -116,7 +116,7 @@ def _simplified_layernorm(gb, x, weight_name, eps, name_prefix, skip=None, need_
     # skip=<name> -> SkipSimplifiedLayerNormalization (com.microsoft domain): computes
     # sum = x + skip, then Y = norm(sum). need_sum=True also returns the sum (4th output);
     # the sum feeds the *next* layer's fused input-norm, or -- for the very last node this
-    # module builds -- becomes `encoder_hidden_state` directly (via sum_output_name, so the
+    # module builds -- becomes `encoder_hidden_states` directly (via sum_output_name, so the
     # graph's final output tensor is produced directly by this node, no extra rename op).
     inputs = [x, weight_name] if skip is None else [x, skip, weight_name]
     op_type = ("Skip" if skip is not None else "") + "SimplifiedLayerNormalization"
@@ -163,7 +163,7 @@ def _build_decoder_layer(gb, layer_id, layer, root_residual, input_ln_skip, dims
     Returns (resid_before_mlp, mlp_output) -- both needed to build the next layer, and (for
     the last layer this module builds) resid_before_mlp/mlp_output together are what the
     caller feeds into one more `_simplified_layernorm(..., skip=mlp_output, need_sum=True)`
-    call (using the *next* layer's input_layernorm weight) to produce `encoder_hidden_state`.
+    call (using the *next* layer's input_layernorm weight) to produce `encoder_hidden_states`.
     """
     num_attn_heads, num_kv_heads = dims["num_attn_heads"], dims["num_kv_heads"]
     head_size, eps = dims["head_size"], dims["rms_norm_eps"]
@@ -293,18 +293,18 @@ def _build_encoder_graph(checkpoint_dir, dtype="f16"):
         f"model.layers.{tap_id}.input_layernorm.weight",
         layers[tap_id].input_layernorm.weight.detach().to(torch_dtype).numpy(),
     )
-    _, encoder_hidden_state = _simplified_layernorm(
+    _, encoder_hidden_states = _simplified_layernorm(
         gb, root_residual, tap_ln_w, dims["rms_norm_eps"], f"layer{tap_id}/input_layernorm",
-        skip=input_ln_skip, need_sum=True, sum_output_name="encoder_hidden_state",
+        skip=input_ln_skip, need_sum=True, sum_output_name="encoder_hidden_states",
     )
-    assert encoder_hidden_state is not None  # guaranteed by need_sum=True with a non-None skip
+    assert encoder_hidden_states is not None  # guaranteed by need_sum=True with a non-None skip
 
     graph_inputs = [
         helper.make_tensor_value_info(input_ids_name, TensorProto.INT64, ["batch_size", "sequence_length"]),
         helper.make_tensor_value_info(attn_mask_name, TensorProto.INT64, ["batch_size", "total_sequence_length"]),
     ]
     graph_output = helper.make_tensor_value_info(
-        encoder_hidden_state, onnx_dtype, ["batch_size", "sequence_length", dims["hidden_size"]]
+        encoder_hidden_states, onnx_dtype, ["batch_size", "sequence_length", dims["hidden_size"]]
     )
     graph = helper.make_graph(gb.nodes, "zimage_text_encoder", graph_inputs, [graph_output], initializer=gb.initializers)
     onnx_model = helper.make_model(

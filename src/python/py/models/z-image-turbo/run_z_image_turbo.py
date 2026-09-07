@@ -18,7 +18,7 @@ image (the transformer/scheduler_step pair loops `num_inference_steps` times):
       | input_ids, attention_mask
       v
     +--------------------------------+
-    | text_encoder_model_q4f16.onnx  |   input_ids, attention_mask -> encoder_hidden_state
+    | text_encoder_model_q4f16.onnx  |   input_ids, attention_mask -> encoder_hidden_states
     +--------------------------------+
       | encoder_hidden_states  (sliced to prompt length, padded to a multiple of 32 tokens)
       v
@@ -236,8 +236,37 @@ class ZImagePipeline:
             self.sc_prep_output = self.sc_prep.get_outputs()[0].name
             self.safety_checker_output = self.safety_checker.get_outputs()[0].name
 
+        # On a GPU EP, encoder_hidden_states (the padded prompt embeds) is fed to the transformer
+        # unchanged on every denoising step, but it starts life as a host numpy buffer that
+        # to_ort_value can only wrap as a CPU OrtValue (WebGPU can't allocate device memory from a
+        # numpy array -- see to_ort_value). This trivial Identity model uploads it to the device
+        # once per prompt via bind_output, so it's device-resident for the whole loop instead of
+        # re-copied host->device before each transformer call. CPU EP doesn't need it.
+        self.embeds_uploader = None
+        if self.device_type != "cpu":
+            self._build_embeds_uploader(session_kwargs)
+
         self.tokenizer = AutoTokenizer.from_pretrained(os.path.join(model_dir, "tokenizer"))
         self.scheduler = Scheduler()
+
+    def _build_embeds_uploader(self, session_kwargs: dict) -> None:
+        # Built in-memory (no on-disk artifact) as a single-node Identity graph with no declared
+        # shape, so it passes any rank/length through unchanged; only the dtype is fixed, to match
+        # the transformer's encoder_hidden_states input (transformer_dtype).
+        from onnx import helper, TensorProto
+
+        elem_type = TensorProto.FLOAT16 if self.transformer_dtype == np.float16 else TensorProto.FLOAT
+        value_in = helper.make_tensor_value_info("input", elem_type, None)
+        value_out = helper.make_tensor_value_info("output", elem_type, None)
+        graph = helper.make_graph(
+            [helper.make_node("Identity", ["input"], ["output"])], "upload_embeds", [value_in], [value_out]
+        )
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+        model.ir_version = 10
+
+        self.embeds_uploader = ort.InferenceSession(model.SerializeToString(), **session_kwargs)
+        self.embeds_uploader_iob = self.embeds_uploader.io_binding()
+        self.embeds_uploader_output = self.embeds_uploader.get_outputs()[0].name
 
     def to_ort_value(self, array: np.ndarray) -> ort.OrtValue:
         # Host-side numpy buffers can only back a CPU OrtValue -- the pip onnxruntime packages
@@ -323,8 +352,19 @@ class ZImagePipeline:
             pad = np.repeat(embeds[:, -1:, :], pad_len, axis=1)
             embeds = np.concatenate([embeds, pad], axis=1)
 
-        embeds_ov = self.to_ort_value(embeds.astype(self.transformer_dtype))
-        print(f"prompt_embeds device: {embeds_ov.device_name()}")
+        embeds = embeds.astype(self.transformer_dtype)
+        if self.embeds_uploader is None:
+            embeds_ov = self.to_ort_value(embeds)
+        else:
+            # Upload the padded embeds to the device once (see _build_embeds_uploader) so
+            # encoder_hidden_states is device-resident for every transformer step, matching how
+            # latents/noise_pred stay on-device via bind_output, instead of a CPU OrtValue that
+            # ORT re-copies host->device on each call.
+            embeds_ov = self._run_bound(
+                "upload_embeds", self.embeds_uploader, self.embeds_uploader_iob,
+                [self.embeds_uploader_output], {"input": embeds},
+            )[0]
+        print(f"prompt_embeds device: {self._device_label(embeds_ov)}")
         return embeds_ov
 
     def run(
