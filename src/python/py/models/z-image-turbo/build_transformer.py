@@ -42,13 +42,11 @@ import onnx_ir as ir
 import torch
 from onnxruntime_genai.models.builders.base import Model
 
-from external_data_utils import save_ir_model_sharded
-
-# External-data layout: keep small (<= 1 MiB) weights inline in the `.onnx` so
-# ONNX Runtime graph transformations retain cheap access to small constants;
-# shard the larger weights into `<= 2 GiB` `.onnx_data[_N]` files.
-INLINE_SIZE_THRESHOLD_BYTES = 1 * 1024**2
-MAX_SHARD_SIZE_BYTES = 2 * 1024**3
+from external_data_utils import (
+    INLINE_SIZE_THRESHOLD_BYTES,
+    MAX_SHARD_SIZE_BYTES,
+    save_ir_model_sharded,
+)
 
 # Maps the user-facing -p choice to the underlying `Model.onnx_dtype`/quantization
 # setup and whether MatMulNBits int4 weight quantization should be applied.
@@ -245,7 +243,7 @@ class ZImageTransformerModel(Model):
         single `<name>.onnx.data` (`size_threshold_bytes=0`, no sharding). The
         int4-materialization and topological-sort steps are mirrored verbatim
         from the base so quantized builds are unchanged; only the final write is
-        routed through `save_ir_model_sharded` (inline <= 1 MiB, shards <= 2 GiB,
+        routed through `save_ir_model_sharded` (inline <= 1 MiB, shards < 1.9 GiB,
         `<name>.onnx_data[_N]` naming).
         """
         from tqdm import tqdm
