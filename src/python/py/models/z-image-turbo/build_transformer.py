@@ -612,23 +612,23 @@ class ZImageTransformerModel(Model):
 
     def _make_timestep_embedding(self, timestep, weights):
         half = self.t_freq_dim // 2
-        t_scaled = self._mul("/model/z_image/t_embedder/Scale", [timestep, self._const(self.io_dtype, self.t_scale)], [1])
-        t_unsq = self._unsqueeze("/model/z_image/t_embedder/Unsqueeze", t_scaled, [1], [1, 1])
-        args = self._mul("/model/z_image/t_embedder/Args", [t_unsq, "model.t_embedder.freqs"], [1, half])
-        cos_name = "/model/z_image/t_embedder/Cos"
-        sin_name = "/model/z_image/t_embedder/Sin"
+        t_scaled = self._mul("/model/t_embedder/Scale", [timestep, self._const(self.io_dtype, self.t_scale)], [1])
+        t_unsq = self._unsqueeze("/model/t_embedder/Unsqueeze", t_scaled, [1], [1, 1])
+        args = self._mul("/model/t_embedder/Args", [t_unsq, "model.t_embedder.freqs"], [1, half])
+        cos_name = "/model/t_embedder/Cos"
+        sin_name = "/model/t_embedder/Sin"
         self.make_cos(cos_name, args, self.io_dtype, [1, half])
         self.make_sin(sin_name, args, self.io_dtype, [1, half])
-        freq_embed_name = "/model/z_image/t_embedder/Concat"
+        freq_embed_name = "/model/t_embedder/Concat"
         self.make_concat(freq_embed_name, [f"{cos_name}/output_0", f"{sin_name}/output_0"], self.io_dtype, shape=[1, self.t_freq_dim], axis=-1)
         freq_embed = f"{freq_embed_name}/output_0"
 
         hidden = self._linear(
-            "/model/z_image/t_embedder/mlp0", freq_embed, weights.mlp[0], [1, self.t_mid_dim], exclude_from_quant=True
+            "/model/t_embedder/mlp.0", freq_embed, weights.mlp[0], [1, self.t_mid_dim], exclude_from_quant=True
         )
-        hidden = self._silu("/model/z_image/t_embedder/mlp0_silu", hidden, [1, self.t_mid_dim])
+        hidden = self._silu("/model/t_embedder/mlp.0/Silu", hidden, [1, self.t_mid_dim])
         adaln_input = self._linear(
-            "/model/z_image/t_embedder/mlp2", hidden, weights.mlp[2], [1, self.adaln_embed_dim], exclude_from_quant=True
+            "/model/t_embedder/mlp.2", hidden, weights.mlp[2], [1, self.adaln_embed_dim], exclude_from_quant=True
         )
         return adaln_input
 
@@ -706,13 +706,13 @@ class ZImageTransformerModel(Model):
         shape3 = [1, num_tokens_shape, self.dim]
         hidden_shape = [1, num_tokens_shape, ff.w1.out_features]
         gate = self._linear(f"{name}/w1", x, ff.w1, hidden_shape)
-        gate = self._silu(f"{name}/w1_silu", gate, hidden_shape)
+        gate = self._silu(f"{name}/w1/Silu", gate, hidden_shape)
         up = self._linear(f"{name}/w3", x, ff.w3, hidden_shape)
         # float16 overflow protection: split the 1/128 pre-`w2` scale across the two SwiGLU
         # factors (1/8 on the SiLU gate, 1/16 on w3) and apply it *before* the elementwise
         # multiply, so neither the product nor the w2 matmul that consumes it can overflow.
         # `ffn_norm2` (RMSNorm) downstream absorbs the 1/128. No-op for float32 I/O.
-        gate = self._rescale_preout(f"{name}/w1_silu/PreScale", gate, hidden_shape, self.ff_gate_scale)
+        gate = self._rescale_preout(f"{name}/w1/Silu/PreScale", gate, hidden_shape, self.ff_gate_scale)
         up = self._rescale_preout(f"{name}/w3/PreScale", up, hidden_shape, self.ff_up_scale)
         gated = self._mul(f"{name}/Gated", [gate, up], hidden_shape)
         return self._linear(f"{name}/w2", gated, ff.w2, shape3)
@@ -849,17 +849,17 @@ class ZImageTransformerModel(Model):
 
         x_embedder = self.weights.all_x_embedder[self.patch_key]
         img_tokens = self._linear(
-            "/model/z_image/x_embedder", img_patches_b, x_embedder, [1, "img_seq_len", self.dim],
+            "/model/x_embedder", img_patches_b, x_embedder, [1, "img_seq_len", self.dim],
             exclude_from_quant=True,
         )
 
         # --- caption embed ---
         cap_norm = self._rms_norm(
-            "/model/z_image/cap_embedder_norm", encoder_hidden_states, self.weights.cap_embedder[0].weight,
+            "/model/cap_embedder.0", encoder_hidden_states, self.weights.cap_embedder[0].weight,
             [1, "cap_seq_len", self.cap_feat_dim],
         )
         cap_tokens = self._linear(
-            "/model/z_image/cap_embedder_linear", cap_norm, self.weights.cap_embedder[1], [1, "cap_seq_len", self.dim],
+            "/model/cap_embedder.1", cap_norm, self.weights.cap_embedder[1], [1, "cap_seq_len", self.dim],
             exclude_from_quant=True,
         )
 
@@ -906,18 +906,18 @@ class ZImageTransformerModel(Model):
 
         # --- final layer (AdaLN + LayerNorm(no affine) + Linear) ---
         final_layer = self.weights.all_final_layer[self.patch_key]
-        final_silu = self._silu("/model/z_image/final_adaLN/silu", adaln_input, [1, self.adaln_embed_dim])
+        final_silu = self._silu("/model/final_layer/adaLN_modulation/Silu", adaln_input, [1, self.adaln_embed_dim])
         final_scale_raw = self._linear(
-            "/model/z_image/final_adaLN/Linear0", final_silu, final_layer.adaLN_modulation[1], [1, self.dim],
+            "/model/final_layer/adaLN_modulation.1", final_silu, final_layer.adaLN_modulation[1], [1, self.dim],
             exclude_from_quant=True,
         )
-        final_scale = self._add_scalar("/model/z_image/final_adaLN/Plus1", final_scale_raw, 1.0, [1, self.dim])
-        final_scale = self._unsqueeze("/model/z_image/final_adaLN/Unsqueeze", final_scale, [1], [1, 1, self.dim])
+        final_scale = self._add_scalar("/model/final_layer/adaLN_modulation.1/Plus1", final_scale_raw, 1.0, [1, self.dim])
+        final_scale = self._unsqueeze("/model/final_layer/adaLN_modulation.1/Unsqueeze", final_scale, [1], [1, 1, self.dim])
 
-        normed = self._layer_norm_no_affine("/model/z_image/final_norm", x, [1, "unified_seq_len", self.dim])
-        scaled = self._mul("/model/z_image/final_scale_mul", [normed, final_scale], [1, "unified_seq_len", self.dim])
+        normed = self._layer_norm_no_affine("/model/final_layer/norm_final", x, [1, "unified_seq_len", self.dim])
+        scaled = self._mul("/model/final_layer/ScaleMul", [normed, final_scale], [1, "unified_seq_len", self.dim])
         out_patches = self._linear(
-            "/model/z_image/final_linear", scaled, final_layer.linear, [1, "unified_seq_len", self.patch_dim]
+            "/model/final_layer/linear", scaled, final_layer.linear, [1, "unified_seq_len", self.patch_dim]
         )
 
         # --- unpatchify: image tokens are the first `num_img_tokens` rows ---
