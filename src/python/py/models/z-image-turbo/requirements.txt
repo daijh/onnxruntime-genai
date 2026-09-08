@@ -27,13 +27,18 @@ onnxruntime==1.29.0
 transformers==5.16.1
 tqdm==4.70.0
 
+# build_text_encoder.py loads the Qwen3 encoder with `low_cpu_mem_usage=True`; without
+# `accelerate` installed, transformers ignores that flag (falling back to
+# `low_cpu_mem_usage=False`) and prints a warning. Install it for faster, less
+# memory-intense weight loading during export.
+accelerate==1.14.0
+
 onnx==1.22.0
-# Held back from the latest 1.0.0 (a major-version jump from the 0.x line this experiment was
-# built and verified against): onnxruntime-genai's `Model` base class builds its IR graph
-# through this package internally, and 1.0.0's API surface hasn't been verified against it in
-# this session -- bump only after confirming build_transformer.py/build_vae_decoder.py still
-# produce correct output.
-onnx-ir==0.2.1
+# 1.0.0 required: external_data_utils.save_ir_model_sharded passes `max_shard_size_bytes` to
+# `ir.save`, a parameter only added in onnx-ir 1.0.0 (the 0.2.x `ir.save` signature has no such
+# argument and raises TypeError). onnxruntime-genai's `Model` base class also builds its IR graph
+# through this package internally.
+onnx-ir==1.0.0
 torch==2.14.0
 diffusers==0.40.0
 numpy==2.5.3

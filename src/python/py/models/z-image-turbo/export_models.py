@@ -30,6 +30,7 @@ and can be pointed at directly, e.g. by run_z_image_turbo.py.
 import argparse
 import os
 import shutil
+import subprocess
 import sys
 
 import build_helper_models
@@ -39,6 +40,7 @@ import build_transformer
 import build_vae_decoder
 
 NOT_YET_PORTED = ()
+ALL_COMPONENTS = ("transformer", "text_encoder", "vae_decoder", "helper_models", "safety_checker")
 
 # Small tokenizer files that AutoTokenizer.from_pretrained needs; they live in the checkpoint's
 # sibling `tokenizer/` folder, not `text_encoder/`.
@@ -155,24 +157,50 @@ def copy_tokenizer(input_path, output_dir):
         print(f"Copied tokenizer to {dest_dir}")
 
 
+def build_component_subprocess(model, args):
+    cmd = [sys.executable, os.path.abspath(__file__), args.input_path, "-m", model, "-o", args.output_dir]
+    if args.extra_options:
+        cmd += ["--extra_options", *args.extra_options]
+    if args.safety_checker_checkpoint:
+        cmd += ["--safety_checker_checkpoint", args.safety_checker_checkpoint]
+    return subprocess.run(cmd).returncode
+
+
+def build_all(args):
+    results = {}
+    for model in ALL_COMPONENTS:
+        if model == "safety_checker" and not args.safety_checker_checkpoint:
+            print(f"\nSkipping {model}: no --safety_checker_checkpoint given")
+            results[model] = "skipped"
+            continue
+        print(f"\n=== Building {model} (isolated subprocess) ===")
+        returncode = build_component_subprocess(model, args)
+        results[model] = "ok" if returncode == 0 else f"FAILED (exit {returncode})"
+
+    print("\n=== Summary ===")
+    for model in ALL_COMPONENTS:
+        print(f"  {model:<14} {results.get(model, 'skipped')}")
+
+    failed = [m for m, status in results.items() if status.startswith("FAILED")]
+    return results, failed
+
+
 def main():
     args = get_args()
     if args.model == "all":
-        onnx_dir = args.output_dir
-        for model in ("transformer", "text_encoder", "vae_decoder", "helper_models", "safety_checker", *NOT_YET_PORTED):
-            try:
-                onnx_dir = build_one(
-                    model, args.input_path, args.output_dir, args.extra_options, args.safety_checker_checkpoint
-                )
-            except NotImplementedError as e:
-                print(f"Skipping {model}: {e}")
+        _results, failed = build_all(args)
+        copy_tokenizer(args.input_path, args.output_dir)
+        onnx_dir = os.path.join(args.output_dir, "onnx")
+        if failed:
+            print(f"\nFailure: {len(failed)} component(s) failed: {', '.join(failed)}", file=sys.stderr)
+            sys.exit(1)
+        print(f"\nSuccess: all exported to {onnx_dir}")
     else:
         onnx_dir = build_one(
             args.model, args.input_path, args.output_dir, args.extra_options, args.safety_checker_checkpoint
         )
-
-    copy_tokenizer(args.input_path, args.output_dir)
-    print(f"\nSuccess: {args.model} exported to {onnx_dir}")
+        copy_tokenizer(args.input_path, args.output_dir)
+        print(f"\nSuccess: {args.model} exported to {onnx_dir}")
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@
 Self-contained experiment: export pieces of the
 [Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) text-to-image pipeline to
 plain ONNX graphs. Unlike `../builders/zimage*.py`, these `build_*.py` scripts depend only on
-the *public* `onnxruntime-genai` pip package (not this repo's own `../builders/base.py` source
+the _public_ `onnxruntime-genai` pip package (not this repo's own `../builders/base.py` source
 tree), so each one runs standalone with just `pip install -r requirements.txt` -- no
 onnxruntime-genai checkout required.
 
@@ -11,13 +11,13 @@ onnxruntime-genai checkout required.
 
 ## Status
 
-| Component | Script | Status |
-|---|---|---|
-| Transformer trunk | `build_transformer.py` | done |
-| Text encoder (Qwen3) | `build_text_encoder.py` | done |
-| VAE decoder | `build_vae_decoder.py` | done |
-| Helper models (scheduler_step / vae_pre_process / sc_prep) | `build_helper_models.py` | done |
-| Safety checker | `build_safety_checker.py` | done (needs its own separate checkpoint, see below) |
+| Component                                                  | Script                    | Status                                              |
+| ---------------------------------------------------------- | ------------------------- | --------------------------------------------------- |
+| Transformer trunk                                          | `build_transformer.py`    | done                                                |
+| Text encoder (Qwen3)                                       | `build_text_encoder.py`   | done                                                |
+| VAE decoder                                                | `build_vae_decoder.py`    | done                                                |
+| Helper models (scheduler_step / vae_pre_process / sc_prep) | `build_helper_models.py`  | done                                                |
+| Safety checker                                             | `build_safety_checker.py` | done (needs its own separate checkpoint, see below) |
 
 Every component is ported -- `export_models.py -m all` (or no `-m`) builds the full pipeline
 in one bundle directory (safety_checker needs `--safety_checker_checkpoint`, see below; it's
@@ -25,9 +25,13 @@ skipped otherwise).
 
 ## Install
 
+Python >= 3.12.0 is recommended. Create and activate a virtual environment first, e.g.:
+
 ```bash
 cd src/python/py/models/z-image-turbo
-pip install -r requirements.txt  # needs Python 3.11/3.12/3.13
+py -3.12 -m venv .venv
+source .venv/Scripts/activate  # on Windows (bash); use `.venv\Scripts\activate` in cmd/PowerShell, or `source .venv/bin/activate` on Linux/macOS
+pip install -r requirements.txt
 ```
 
 ## Usage
@@ -57,7 +61,7 @@ python export_models.py path_to_local_folder -m helper_models
 `path_to_local_folder` may be the checkpoint's repo root (with `transformer/`/`text_encoder/`/
 `vae/` subfolders) or a component subfolder directly -- both are auto-detected.
 
-The safety checker is a real pretrained CLIP classifier from a *separate* checkpoint
+The safety checker is a real pretrained CLIP classifier from a _separate_ checkpoint
 (`CompVis/stable-diffusion-safety-checker`, not part of the Z-Image-Turbo checkpoint), so it
 needs its own `--safety_checker_checkpoint`:
 
