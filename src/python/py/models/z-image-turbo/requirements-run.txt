@@ -15,7 +15,12 @@
 onnxruntime-webgpu==1.27.0
 
 numpy==2.5.3
-torch==2.14.0
+
+# CPU-only build: the default PyPI `torch` wheel bundles/depends on nvidia-*-cu12 CUDA
+# packages even though these run scripts drive inference through onnxruntime-webgpu, not
+# torch. `--extra-index-url` pulls the `+cpu` variant from PyTorch's own index instead.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.14.0+cpu
 psutil==7.2.2
 pillow==12.3.0
 transformers==5.16.1

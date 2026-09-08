@@ -39,7 +39,13 @@ onnx==1.22.0
 # argument and raises TypeError). onnxruntime-genai's `Model` base class also builds its IR graph
 # through this package internally.
 onnx-ir==1.0.0
-torch==2.14.0
+
+# CPU-only build: the default PyPI `torch` wheel bundles/depends on nvidia-*-cu12 CUDA
+# packages even though these exporters only trace/export on CPU. `--extra-index-url` pulls
+# the `+cpu` variant from PyTorch's own index instead (cp311/cp312/cp313 only, matching this
+# file's supported interpreters).
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.14.0+cpu
 diffusers==0.40.0
 numpy==2.5.3
 
