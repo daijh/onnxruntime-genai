@@ -30,8 +30,11 @@ embeddings fused in (`do_rotary=1`, matching the generic builder's default for a
 non-DML EP), and Q/K per-head RMSNorm kept as separate ops (not fused into GQA, so GQA
 stays at its <=12-input schema form). GQA derives each token's rotary position
 internally from `seqlens_k`/`total_seq_len` (itself derived from `attention_mask` via a
-graph-capture-style reformatting subgraph) -- no `position_ids` input exists anywhere in
-this graph, external or internal. No KV cache graph inputs are ever emitted;
+reformatting subgraph) -- no `position_ids` input exists anywhere in this graph, external or
+internal. The mask reformat defaults to the standard `Shape`-based form (matching base.py's
+`make_attention_mask_reformatting_for_gqa`), which WebNN EP prefers; passing
+`enable_webgpu_graph=true` via `--extra_options` instead emits the Shape-free, GPU-only
+graph-capture variant for WebGPU graph capture. No KV cache graph inputs are ever emitted;
 GroupQueryAttention gets empty `past_key`/`past_value`.
 
 `dtype` ("f16" or "f32") controls the I/O and weight dtype throughout; `quantize`
@@ -119,7 +122,14 @@ class _GraphBuilder:
         self.initializers = []
 
     def initializer(self, name, array):
-        self.initializers.append(numpy_helper.from_array(np.ascontiguousarray(array), name=name))
+        array = np.asarray(array)
+        # np.ascontiguousarray promotes 0-d scalars to shape (1,); keep true scalars 0-d so a
+        # scalar Gather index yields a scalar Gather output. GroupQueryAttention's
+        # total_sequence_length must be a scalar (this is the form the generic builder emits and
+        # that WebNN EP's static-shape GQA requires); a 1-D [1] length trips it up.
+        if array.ndim:
+            array = np.ascontiguousarray(array)
+        self.initializers.append(numpy_helper.from_array(array, name=name))
         return name
 
     def const_i64(self, name, values):
@@ -130,21 +140,48 @@ class _GraphBuilder:
         return outputs[0]
 
 
-def _attention_mask_reformat(gb, attention_mask_name):
-    # Mirrors builders/expansions/webgpu.py's WebGPU.make_attention_mask_graph_capture_
-    # reformatting_for_gqa (no Shape op -- everything stays derivable from attention_mask):
-    #   attention_mask -> Cast(int32) -> ReduceSum(axis=1, keepdims=0) -> {Sub 1 -> seqlens_k;
-    #                                                                      ReduceMax -> total_seq_len}
-    mask_i32 = gb.node("Cast", [attention_mask_name], ["attn_mask_reformat/mask_i32"],
-                        "attn_mask_reformat/Cast", to=TensorProto.INT32)
+def _attention_mask_reformat(gb, attention_mask_name, enable_webgpu_graph=False):
+    # Derive GroupQueryAttention's seqlens_k/total_seq_len from the 2D attention_mask. Two
+    # variants, matching the generic builder; selected by `enable_webgpu_graph`:
+    #
+    # enable_webgpu_graph=True -- No Shape op, so every op runs on GPU (required
+    #   for WebGPU graph capture); total_seq_len comes from ReduceMax over the per-row valid
+    #   token counts:
+    #     attention_mask -> Cast(int32) -> ReduceSum(axis=1, keepdims=0) -> {Sub 1 -> seqlens_k;
+    #                                                                        ReduceMax -> total_seq_len}
+    #
+    # enable_webgpu_graph=False (default) -- total_seq_len is the (padded) sequence-length dim via a Shape op (runs on CPU).
+    #   This is the form WebNN EP prefers:
+    #     attention_mask -> ReduceSum(axis=1, keepdims=0) -> Sub 1 -> Cast(int32) -> seqlens_k
+    #     attention_mask -> Shape -> Gather(index 1) -> Cast(int32) -> total_seq_len
+    if enable_webgpu_graph:
+        mask_i32 = gb.node("Cast", [attention_mask_name], ["attn_mask_reformat/mask_i32"],
+                            "attn_mask_reformat/Cast", to=TensorProto.INT32)
+        axis1 = gb.const_i64("attn_mask_reformat/axis1", [1])
+        mask_sum = gb.node("ReduceSum", [mask_i32, axis1], ["attn_mask_reformat/mask_sum"],
+                            "attn_mask_reformat/ReduceSum", keepdims=0)
+        one_i32 = gb.initializer("attn_mask_reformat/one_i32", np.array([1], dtype=np.int32))
+        seqlens_k = gb.node("Sub", [mask_sum, one_i32], ["attn_mask_reformat/seqlens_k"],
+                             "attn_mask_reformat/Sub")
+        total_seq_len = gb.node("ReduceMax", [mask_sum], ["attn_mask_reformat/total_seq_len"],
+                                 "attn_mask_reformat/ReduceMax", keepdims=0)
+        return seqlens_k, total_seq_len
+
+    # Standard (Shape-based) form.
     axis1 = gb.const_i64("attn_mask_reformat/axis1", [1])
-    mask_sum = gb.node("ReduceSum", [mask_i32, axis1], ["attn_mask_reformat/mask_sum"],
+    mask_sum = gb.node("ReduceSum", [attention_mask_name, axis1], ["attn_mask_reformat/mask_sum"],
                         "attn_mask_reformat/ReduceSum", keepdims=0)
-    one_i32 = gb.initializer("attn_mask_reformat/one_i32", np.array([1], dtype=np.int32))
-    seqlens_k = gb.node("Sub", [mask_sum, one_i32], ["attn_mask_reformat/seqlens_k"],
-                         "attn_mask_reformat/Sub")
-    total_seq_len = gb.node("ReduceMax", [mask_sum], ["attn_mask_reformat/total_seq_len"],
-                             "attn_mask_reformat/ReduceMax", keepdims=0)
+    one_i64 = gb.const_i64("attn_mask_reformat/one_i64", [1])
+    sub = gb.node("Sub", [mask_sum, one_i64], ["attn_mask_reformat/sub"], "attn_mask_reformat/Sub")
+    seqlens_k = gb.node("Cast", [sub], ["attn_mask_reformat/seqlens_k"],
+                        "attn_mask_reformat/Sub/Cast", to=TensorProto.INT32)
+
+    shape = gb.node("Shape", [attention_mask_name], ["attn_mask_reformat/shape"], "attn_mask_reformat/Shape")
+    idx1 = gb.const_i64("attn_mask_reformat/idx1", 1)
+    gathered = gb.node("Gather", [shape, idx1], ["attn_mask_reformat/gathered"],
+                        "attn_mask_reformat/Gather", axis=0)
+    total_seq_len = gb.node("Cast", [gathered], ["attn_mask_reformat/total_seq_len"],
+                            "attn_mask_reformat/Gather/Cast", to=TensorProto.INT32)
     return seqlens_k, total_seq_len
 
 
@@ -287,7 +324,7 @@ def _quantize_int4(onnx_model):
     return quantized
 
 
-def _build_encoder_graph(checkpoint_dir, dtype="f16"):
+def _build_encoder_graph(checkpoint_dir, dtype="f16", enable_webgpu_graph=False):
     torch_dtype = _TORCH_DTYPES[dtype]
     onnx_dtype = _ONNX_DTYPES[dtype]
     np_dtype = _NP_DTYPES[dtype]
@@ -312,7 +349,7 @@ def _build_encoder_graph(checkpoint_dir, dtype="f16"):
                               model.model.embed_tokens.weight.detach().to(torch_dtype).numpy())
     embeddings = gb.node("Gather", [embed_w, input_ids_name], ["embeddings"], "embed/Gather", axis=0)
 
-    seqlens_k_name, total_seq_len_name = _attention_mask_reformat(gb, attn_mask_name)
+    seqlens_k_name, total_seq_len_name = _attention_mask_reformat(gb, attn_mask_name, enable_webgpu_graph)
 
     root_residual, input_ln_skip = embeddings, None
     for layer_id in range(num_layers - 1):
@@ -353,8 +390,8 @@ def _build_encoder_graph(checkpoint_dir, dtype="f16"):
     return onnx_model
 
 
-def export_qwen3_text_encoder(checkpoint_dir, output_onnx_path, quantize, dtype="f16"):
-    onnx_model = _build_encoder_graph(checkpoint_dir, dtype=dtype)
+def export_qwen3_text_encoder(checkpoint_dir, output_onnx_path, quantize, dtype="f16", enable_webgpu_graph=False):
+    onnx_model = _build_encoder_graph(checkpoint_dir, dtype=dtype, enable_webgpu_graph=enable_webgpu_graph)
     if quantize:
         onnx_model = _quantize_int4(onnx_model)
 
@@ -376,6 +413,11 @@ def build(input_path, output_dir, precision="f16_int4_quant", extra_options=None
         raise ValueError(f"Unknown precision '{precision}'; choose from {sorted(PRECISION_CONFIGS)}")
     config = PRECISION_CONFIGS[precision]
 
+    # `enable_webgpu_graph=true` selects the GPU-only, Shape-free graph-capture mask reformat;
+    # anything else (the default) uses the standard Shape-based form that WebNN EP prefers.
+    extra_options = extra_options or {}
+    enable_webgpu_graph = str(extra_options.get("enable_webgpu_graph", "false")).lower() not in ("false", "0", "")
+
     onnx_dir = os.path.join(output_dir, "onnx")
     os.makedirs(onnx_dir, exist_ok=True)
 
@@ -383,6 +425,7 @@ def build(input_path, output_dir, precision="f16_int4_quant", extra_options=None
     output_onnx = os.path.join(onnx_dir, f"text_encoder_model_{suffix}.onnx")
     export_qwen3_text_encoder(
         input_path, output_onnx, quantize=config["quantize"], dtype=config["dtype"],
+        enable_webgpu_graph=enable_webgpu_graph,
     )
     return onnx_dir
 
@@ -400,8 +443,9 @@ def get_args():
     )
     parser.add_argument(
         "--extra_options", nargs="*", default=[],
-        help="Extra key=value options (currently unused; kept for CLI consistency with the "
-        "other build_*.py scripts).",
+        help="Extra key=value options. Supported: enable_webgpu_graph=true|false (default false). "
+        "true emits the GPU-only graph-capture attention-mask reformat (WebGPU graph capture); "
+        "false emits the standard Shape-based form preferred by WebNN EP.",
     )
     return parser.parse_args()
 
