@@ -2,22 +2,20 @@
 
 Self-contained experiment: export pieces of the
 [Z-Image-Turbo](https://huggingface.co/Tongyi-MAI/Z-Image-Turbo) text-to-image pipeline to
-plain ONNX graphs. Unlike `../builders/zimage*.py`, these `build_*.py` scripts depend only on
-the _public_ `onnxruntime-genai` pip package (not this repo's own `../builders/base.py` source
-tree), so each one runs standalone with just `pip install -r requirements.txt` -- no
-onnxruntime-genai checkout required.
+plain ONNX graphs, using only the _public_ `onnxruntime-genai` pip package -- no checkout of
+this repo's own source tree required, just `pip install -r requirements.txt`.
 
-`export_models.py` is the main entry point; each component also has its own standalone CLI.
+`export_models.py` is the entry point for all components.
 
 ## Status
 
-| Component                                                  | Script                    | Status                                              |
-| ---------------------------------------------------------- | ------------------------- | --------------------------------------------------- |
-| Transformer trunk                                          | `build_transformer.py`    | done                                                |
-| Text encoder (Qwen3)                                       | `build_text_encoder.py`   | done                                                |
-| VAE decoder                                                | `build_vae_decoder.py`    | done                                                |
-| Helper models (scheduler_step / vae_pre_process / sc_prep) | `build_helper_models.py`  | done                                                |
-| Safety checker                                             | `build_safety_checker.py` | done (needs its own separate checkpoint, see below) |
+| Component                                                    | Status                                              |
+| ------------------------------------------------------------- | ---------------------------------------------------- |
+| Transformer trunk                                              | done                                                 |
+| Text encoder (Qwen3)                                           | done                                                 |
+| VAE decoder                                                    | done                                                 |
+| Helper models (scheduler_step / vae_pre_process / sc_prep)     | done                                                 |
+| Safety checker                                                 | done (needs its own separate checkpoint, see below) |
 
 Every component is ported -- `export_models.py -m all` (or no `-m`) builds the full pipeline
 in one bundle directory (safety_checker needs `--safety_checker_checkpoint`, see below; it's
@@ -77,20 +75,10 @@ python export_models.py path_to_local_folder -m safety_checker --safety_checker_
 `-m all` includes it too if `--safety_checker_checkpoint` is given; otherwise it's skipped
 (with a message) so `-m all` still works without it.
 
-Each `build_*.py` also works standalone, e.g.:
-
-```bash
-python build_transformer.py path_to_local_folder/transformer -o my_output_dir -p f16_int4_quant
-python build_text_encoder.py path_to_local_folder/text_encoder -o my_output_dir -p f16_int4_quant
-python build_vae_decoder.py path_to_local_folder/vae -o my_output_dir -p f16
-python build_helper_models.py -o my_output_dir -p f16
-python build_safety_checker.py path_to_safety_checker_folder -o my_output_dir -p f16
-```
-
 All `.onnx` output (+ external data) lands under `<output_dir>/onnx/`, so multiple components
 can share one output directory. No `genai_config.json` is produced -- these are standalone
 ONNX graphs, not onnxruntime-genai C++ runtime integrations. A caller drives the diffusion
-sampling loop itself; see `run_z_image_turbo.py` for a reference driver.
+sampling loop itself.
 
 `export_models.py` (but not the individual `build_*.py` scripts) also copies the checkpoint's
 tokenizer files (`merges.txt`, `tokenizer.json`, `tokenizer_config.json`, `vocab.json` -- from
@@ -99,9 +87,9 @@ the checkpoint's `tokenizer/` folder, resolved relative to `text_encoder/`) into
 
 ### Options
 
-- `-p/--precision`: `build_transformer.py` and `build_text_encoder.py` support `f16` / `f32` /
-  `f16_int4_quant` (default) / `f32_int4_quant`; `build_vae_decoder.py`,
-  `build_helper_models.py`, and `build_safety_checker.py` support `f16` (default) / `f32` only.
+- `-p/--precision`: for `-m transformer`/`-m text_encoder`, `f16` / `f32` / `f16_int4_quant`
+  (default) / `f32_int4_quant`; for `-m vae_decoder`/`-m helper_models`/`-m safety_checker`,
+  `f16` (default) / `f32` only.
 - `--extra_options key=value ...`: passed through to the component's builder, e.g.
-  `fuse_group_norm=true` (VAE decoder) or `height=512 width=512 num_inference_steps=8`
-  (helper models).
+  `fuse_group_norm=true` (`-m vae_decoder`) or `height=512 width=512 num_inference_steps=8`
+  (`-m helper_models`).
