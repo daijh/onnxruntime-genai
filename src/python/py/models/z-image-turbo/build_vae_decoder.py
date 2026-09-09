@@ -3,13 +3,9 @@
 # Licensed under the MIT License.  See License.txt in the project root for
 # license information.
 # --------------------------------------------------------------------------
-# Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
-# Portions of this file consist of AI generated content.
+# Modifications Copyright (C) 2026 Intel Corporation. All rights reserved.
 # --------------------------------------------------------------------------
-
-"""
-Standalone exporter for the Z-Image-Turbo VAE decoder.
-"""
+"""Standalone exporter for the Z-Image-Turbo VAE decoder (`AutoencoderKL.decoder`)."""
 
 import argparse
 import json
@@ -132,8 +128,6 @@ class ZImageVAEDecoderModel(Model):
         self.input_names = {"latent_sample": "latent_sample"}
         self.output_names = {"sample": "sample"}
 
-        # batch is fixed at 1 across the whole pipeline (the transformer hardcodes batch=1), so
-        # pin it here too -- a static leading dim helps ORT's graph optimizations.
         latent = self.make_value(
             "latent_sample", self._io_dtype,
             shape=[1, self.latent_channels, "latent_height", "latent_width"],
@@ -206,15 +200,15 @@ class ZImageVAEDecoderModel(Model):
         if self.fuse_group_norm:
             return self._group_norm_fused(name, source, gnmod, swish, expose_skip)
 
-        s = None
+        skip_sum = None
         if isinstance(source, tuple):
             conv_branch, skip_branch = source
-            s = self._add(f"{name}/skip_add", [conv_branch, skip_branch])
-            x = s
+            skip_sum = self._add(f"{name}/skip_add", [conv_branch, skip_branch])
+            x = skip_sum
         else:
             x = source
-        y = self._group_norm_decomposed(name, x, gnmod, swish)
-        return y, (s if expose_skip else None)
+        normed = self._group_norm_decomposed(name, x, gnmod, swish)
+        return normed, (skip_sum if expose_skip else None)
 
     def _group_norm_decomposed(self, name, x_nchw, gnmod, swish):
         groups = int(gnmod.num_groups)
@@ -234,19 +228,19 @@ class ZImageVAEDecoderModel(Model):
         grouped = self._reshape(
             f"{name}/to_groups", x_nchw, self._const(ir.DataType.INT64, [0, groups, -1])
         )
-        normed = f"{name}/InstanceNormalization/output_0"
+        in_normed = f"{name}/InstanceNormalization/output_0"
         self.make_node(
-            "InstanceNormalization", inputs=[grouped, in_scale, in_bias], outputs=[normed],
+            "InstanceNormalization", inputs=[grouped, in_scale, in_bias], outputs=[in_normed],
             name=f"{name}/InstanceNormalization", epsilon=eps,
         )
-        self.make_value(normed, self._io_dtype)
-        y = self._reshape(f"{name}/from_groups", normed, f"{name}/in_shape/output_0")
-        y = self._mul(f"{name}/Mul", [y, gamma])
-        y = self._add(f"{name}/Add", [y, beta])
+        self.make_value(in_normed, self._io_dtype)
+        normed = self._reshape(f"{name}/from_groups", in_normed, f"{name}/in_shape/output_0")
+        normed = self._mul(f"{name}/Mul", [normed, gamma])
+        normed = self._add(f"{name}/Add", [normed, beta])
         if swish:
-            self.make_sigmoid(f"{name}/Sigmoid", y, self._io_dtype, shape=None)
-            y = self._mul(f"{name}/silu", [y, f"{name}/Sigmoid/output_0"])
-        return y
+            self.make_sigmoid(f"{name}/Sigmoid", normed, self._io_dtype, shape=None)
+            normed = self._mul(f"{name}/silu", [normed, f"{name}/Sigmoid/output_0"])
+        return normed
 
     def _group_norm_fused(self, name, source, gnmod, swish, expose_skip):
         gamma = self._init_name(name, ".weight")
@@ -261,61 +255,61 @@ class ZImageVAEDecoderModel(Model):
             conv_branch, skip_branch = source
             x_nhwc = self._transpose(f"{name}/x_t", conv_branch, [0, 2, 3, 1])
             skip_nhwc = self._transpose(f"{name}/skip_t", skip_branch, [0, 2, 3, 1])
-            y_nhwc = f"{name}/output_0"
-            outputs = [y_nhwc]
-            s_nhwc = None
+            normed_nhwc = f"{name}/output_0"
+            outputs = [normed_nhwc]
+            skip_sum_nhwc = None
             if expose_skip:
-                s_nhwc = f"{name}/sum"
-                outputs.append(s_nhwc)
+                skip_sum_nhwc = f"{name}/sum"
+                outputs.append(skip_sum_nhwc)
             self.make_node(
                 "SkipGroupNorm", inputs=[x_nhwc, gamma, beta, skip_nhwc], outputs=outputs,
                 name=name, domain="com.microsoft",
                 activation=activation, channels_last=1, epsilon=eps, groups=groups,
             )
-            for o in outputs:
-                self.make_value(o, self._io_dtype)
-            y = self._transpose(f"{name}/post_t", y_nhwc, [0, 3, 1, 2])
-            s = self._transpose(f"{name}/sum_post_t", s_nhwc, [0, 3, 1, 2]) if s_nhwc else None
-            return y, s
+            for output in outputs:
+                self.make_value(output, self._io_dtype)
+            normed = self._transpose(f"{name}/post_t", normed_nhwc, [0, 3, 1, 2])
+            skip_sum = self._transpose(f"{name}/sum_post_t", skip_sum_nhwc, [0, 3, 1, 2]) if skip_sum_nhwc else None
+            return normed, skip_sum
 
         x_nhwc = self._transpose(f"{name}/x_t", source, [0, 2, 3, 1])
-        y_nhwc = f"{name}/output_0"
+        normed_nhwc = f"{name}/output_0"
         self.make_node(
-            "GroupNorm", inputs=[x_nhwc, gamma, beta], outputs=[y_nhwc],
+            "GroupNorm", inputs=[x_nhwc, gamma, beta], outputs=[normed_nhwc],
             name=name, domain="com.microsoft",
             activation=activation, channels_last=1, epsilon=eps, groups=groups,
         )
-        self.make_value(y_nhwc, self._io_dtype)
-        y = self._transpose(f"{name}/post_t", y_nhwc, [0, 3, 1, 2])
-        return y, None
+        self.make_value(normed_nhwc, self._io_dtype)
+        normed = self._transpose(f"{name}/post_t", normed_nhwc, [0, 3, 1, 2])
+        return normed, None
 
     # ------------------------------------------------------------------
     # ResNet block
     # ------------------------------------------------------------------
     def _resnet(self, name, source, resnet):
-        y, s = self._group_norm(f"{name}/norm1", source, resnet.norm1, swish=True, expose_skip=True)
-        if s is not None:
-            # SkipGroupNorm case: identity shortcut, residual base is the fused sum S.
-            residual_base = s
+        normed, skip_sum = self._group_norm(f"{name}/norm1", source, resnet.norm1, swish=True, expose_skip=True)
+        if skip_sum is not None:
+            # SkipGroupNorm case: identity shortcut, residual base is the fused skip sum.
+            residual_base = skip_sum
         elif resnet.conv_shortcut is not None:
             residual_base = self._conv(f"{name}/conv_shortcut", source, resnet.conv_shortcut)
         else:
             residual_base = source
 
-        h = self._conv(f"{name}/conv1", y, resnet.conv1)
-        y2, _ = self._group_norm(f"{name}/norm2", h, resnet.norm2, swish=True)
-        h = self._conv(f"{name}/conv2", y2, resnet.conv2)
-        return (h, residual_base)
+        hidden = self._conv(f"{name}/conv1", normed, resnet.conv1)
+        normed2, _ = self._group_norm(f"{name}/norm2", hidden, resnet.norm2, swish=True)
+        hidden = self._conv(f"{name}/conv2", normed2, resnet.conv2)
+        return (hidden, residual_base)
 
     # ------------------------------------------------------------------
     # Mid-block self-attention (unfused, single-head)
     # ------------------------------------------------------------------
     def _mid_attention(self, name, x_nchw, attn):
         assert attn.heads == 1, f"expected single-head VAE attention, got heads={attn.heads}"
-        gn, _ = self._group_norm(f"{name}/group_norm", x_nchw, attn.group_norm, swish=False)
+        normed, _ = self._group_norm(f"{name}/group_norm", x_nchw, attn.group_norm, swish=False)
 
         to_seq_shape = self._const(ir.DataType.INT64, [0, self.mid_channels, -1])
-        flat = self._reshape(f"{name}/flatten", gn, to_seq_shape)
+        flat = self._reshape(f"{name}/flatten", normed, to_seq_shape)
         seq = self._transpose(f"{name}/to_seq", flat, [0, 2, 1])
 
         q = self._linear(f"{name}/to_q", seq, attn.to_q)
@@ -324,10 +318,10 @@ class ZImageVAEDecoderModel(Model):
 
         scale = self._const(self._io_dtype, self.mid_channels ** -0.25)
         q = self._mul(f"{name}/q_scale", [q, scale])
-        kt = self._transpose(f"{name}/kT", k, [0, 2, 1])  # [1, C, H*W]
-        kt = self._mul(f"{name}/k_scale", [kt, scale])
+        k_t = self._transpose(f"{name}/kT", k, [0, 2, 1])  # [1, C, H*W]
+        k_t = self._mul(f"{name}/k_scale", [k_t, scale])
         scores = f"{name}/scores/output_0"
-        self.make_node("MatMul", inputs=[q, kt], outputs=[scores], name=f"{name}/scores")
+        self.make_node("MatMul", inputs=[q, k_t], outputs=[scores], name=f"{name}/scores")
         self.make_value(scores, self._io_dtype)
         probs = f"{name}/softmax/output_0"
         self.make_node("Softmax", inputs=[scores], outputs=[probs], name=f"{name}/softmax", axis=-1)

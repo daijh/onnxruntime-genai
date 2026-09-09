@@ -3,32 +3,9 @@
 # Licensed under the MIT License.  See License.txt in the project root for
 # license information.
 # --------------------------------------------------------------------------
-# Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
-# Portions of this file consist of AI generated content.
+# Modifications Copyright (C) 2026 Intel Corporation. All rights reserved.
 # --------------------------------------------------------------------------
-"""Standalone exporter for the Z-Image-Turbo NSFW safety checker.
-
-Self-contained port of ../builders/zimage_safety_checker.py: unlike build_transformer.py /
-build_vae_decoder.py, this component was never coupled to onnxruntime-genai's `Model` base
-class in the first place -- it's a real pretrained CLIP ViT-L/14 vision classifier
-(cosine-distance threshold check against 17 "concept" and 3 "special care" reference
-embeddings), exported via `diffusers`' `StableDiffusionSafetyChecker`, not authored from
-scratch like the transformer/VAE. Only `torch`, `diffusers`, `onnx`, `onnxruntime`, and
-`onnxconverter_common` (via build_helper_models.convert_to_f16, reused rather than
-duplicated) are needed.
-
-`diffusers`' `StableDiffusionSafetyChecker` already ships a `forward_onnx(clip_input, images)`
-method written for ONNX export; `SafetyCheckerOnnxWrapper` below wraps it with the `images`
-masking input/output trimmed off, so the graph is just `clip_input -> has_nsfw_concepts` --
-matching the deployed WebNN bundle's `safety_checker_model_f16.onnx` (confirmed by comparing
-initializer names/shapes: e.g. `vision_model.vision_model.embeddings.patch_embedding.weight
-[1024,3,14,14]`, `concept_embeds [17,768]`, `special_care_embeds [3,768]` line up exactly with
-this class's `__init__`).
-
-The checkpoint is a *separate* download from the Z-Image-Turbo checkpoint itself -- see
-`--safety_checker_checkpoint` in export_models.py, or pass a local
-`CompVis/stable-diffusion-safety-checker`-compatible folder directly to this script.
-"""
+"""Standalone exporter for the Z-Image-Turbo NSFW safety checker."""
 
 import argparse
 import os
@@ -66,15 +43,7 @@ def parse_extra_options(pairs):
 
 
 def optimize_onnx_graph(onnx_path):
-    """Run ORT's EP-neutral (BASIC-level) graph optimizations on `onnx_path`, in place.
-
-    `clip_input` is now a static `[1, 3, 224, 224]`, so ORT can constant-fold the
-    Shape/Gather/Concat/Reshape machinery `torch.onnx.export` emits for dynamic shapes.
-    BASIC stays EP-neutral (standard ONNX ops only -- no CPU-specific fused/layout ops that
-    the pipeline's target WebGPU EP might lack a kernel for), so the optimized graph still
-    runs on WebGPU as well as CPU. Applied on the f32 graph, before the f16 conversion, so
-    constant folding never hits a missing CPU f16 kernel.
-    """
+    """Run ORT's EP-neutral (BASIC-level) graph optimizations on `onnx_path`, in place."""
     tmp_path = onnx_path + ".opt.tmp"
     sess_options = ort.SessionOptions()
     sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
@@ -115,16 +84,6 @@ class SafetyCheckerOnnxWrapper(nn.Module):
 
 
 def build(input_path, output_dir, precision="f16", extra_options=None, opset=17):
-    """Export the safety checker to `<output_dir>/onnx/safety_checker_model_<precision>.onnx`.
-
-    Args:
-        input_path: local folder holding a pre-downloaded `CompVis/stable-diffusion-safety-
-            checker`-compatible checkpoint (config.json + weights), e.g. via
-            `huggingface_hub.snapshot_download`.
-        output_dir: directory to write into (under an `onnx/` subdir, like the other
-            build_*.py scripts).
-        precision: "f16" (default) or "f32".
-    """
     if precision not in PRECISION_CONFIGS:
         raise ValueError(f"Unknown precision '{precision}'; choose from {sorted(PRECISION_CONFIGS)}")
 
@@ -144,8 +103,6 @@ def build(input_path, output_dir, precision="f16", extra_options=None, opset=17)
         f32_path,
         input_names=["clip_input"],
         output_names=["has_nsfw_concepts"],
-        # batch is fixed at 1 across the whole pipeline (the transformer hardcodes batch=1);
-        # no dynamic axes so the leading dim stays a static 1 (dummy input is batch=1).
         dynamic_axes={},
         opset_version=opset,
         do_constant_folding=True,
@@ -153,14 +110,8 @@ def build(input_path, output_dir, precision="f16", extra_options=None, opset=17)
     )
     print(f"  wrote {f32_path} ({os.path.getsize(f32_path) / (1024 * 1024):.1f} MB)")
 
-    # The graph is now fully static-shape (batch fixed at 1); fold the dynamic-shape machinery
-    # torch emits via ORT before converting to f16, so both precisions benefit.
     optimize_onnx_graph(f32_path)
 
-    # Load the final graph as a proto, then save it with small weights inline and the large CLIP
-    # weights in sharded external data -- same layout as the transformer/text encoder, so each
-    # `.onnx_data*` shard stays under the browser's 2 GiB ArrayBuffer ceiling (see
-    # external_data_utils.MAX_SHARD_SIZE_BYTES).
     if precision == "f32":
         final_name = "safety_checker_model_f32.onnx"
         proto = onnx.load(f32_path)

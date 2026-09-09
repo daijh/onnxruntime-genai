@@ -1,55 +1,12 @@
+# -------------------------------------------------------------------------
+# Copyright (c) Microsoft Corporation.  All rights reserved.
+# Licensed under the MIT License.  See License.txt in the project root for
+# license information.
+# --------------------------------------------------------------------------
+# Modifications Copyright (C) 2026 Intel Corporation. All rights reserved.
+# --------------------------------------------------------------------------
 """Reference driver for the standalone Z-Image-Turbo ONNX export in `z-image-turbo-onnx/`
-(see export_models.py / README.md).
-
-Unlike the older `../run_z_image_turbo.py` (written against the WebNN demo's bundled models,
-which mix WebNN-shaped [B,16,1,H,W] 5-frame-axis tensors with dev-model [1,16,H,W] ones and
-support swapping either in), every model here comes from this repo's own exporters and shares
-one fixed shape convention: no frame axis, float16 I/O throughout except the tokenizer/text
-encoder boundary. That removes the need for any shape/dtype auto-detection or path-swapping
-flags.
-
-Pipeline flow -- one box per ONNX model under `<model>/onnx/`, run in this order once per
-image (the transformer/scheduler_step pair loops `num_inference_steps` times):
-
-    prompt
-      |
-      v
-    HF tokenizer (<model>/tokenizer/, not ONNX)
-      | input_ids, attention_mask
-      v
-    +--------------------------------+
-    | text_encoder_model_q4f16.onnx  |   input_ids, attention_mask -> encoder_hidden_states
-    +--------------------------------+
-      | encoder_hidden_states  (sliced to prompt length, padded to a multiple of 32 tokens)
-      v
-    latents (random noise, [1,16,H/8,W/8]) --------------------------------+
-      |                                                                    |
-      |   +===================== per denoising step =====================+
-      |   |                                                                |
-      v   v                                                                |
-    +--------------------------------+                                    |
-    | transformer_model_q4f16.onnx   | <- timestep                        |
-    +--------------------------------+                                    |
-      | noise_pred                                                        |
-      v                                                                    |
-    +--------------------------------+                                    |
-    | scheduler_step_model_f16.onnx  | <- latents, step_info=[step, N]     |
-    +--------------------------------+                                    |
-      | latents (updated)                                                 |
-      +---- next step (feeds back into transformer) ----------------------+
-      |
-      v  (after the final step)
-    +--------------------------------+
-    | vae_pre_process_model_f16.onnx |   latents -> scaled_latents (/scale + shift)
-    +--------------------------------+
-      | scaled_latents
-      v
-    +--------------------------------+
-    | vae_decoder_model_f16.onnx     |   latent_sample -> sample ([1,3,H,W], range [-1,1])
-    +--------------------------------+
-      | sample
-      v
-    PNG file
+(see export_models.py).
 """
 
 import argparse
@@ -85,21 +42,17 @@ def input_dtype(session: ort.InferenceSession, name: str) -> np.dtype:
 
 
 def select_webgpu_device(gpu: int) -> "ort.OrtEpDevice":
-    # Multi-GPU machines can expose more than one WebGPU-capable adapter (e.g. an integrated +
-    # a discrete GPU); --gpu picks which one by index into this list, mirroring the "GPU"
-    # device-type link in the webnn-developer-preview demo (index.js's `?devicetype=gpu`),
-    # which otherwise just takes whatever adapter `navigator.gpu.requestAdapter()` defaults to.
     devices = [d for d in ort.get_ep_devices() if d.ep_name == "WebGpuExecutionProvider"]
     if not devices:
         raise RuntimeError("WebGPU requested but no WebGPU-capable device was found.")
 
     print("Available WebGPU devices:")
     for i, d in enumerate(devices):
-        hw = d.device
-        print(f"  [{i}] {hw.vendor}")
-        print(f"      vendor_id: 0x{hw.vendor_id:04x}")
-        print(f"      device_id: 0x{hw.device_id:04x}")
-        for key, value in hw.metadata.items():
+        device_info = d.device
+        print(f"  [{i}] {device_info.vendor}")
+        print(f"      vendor_id: 0x{device_info.vendor_id:04x}")
+        print(f"      device_id: 0x{device_info.device_id:04x}")
+        for key, value in device_info.metadata.items():
             print(f"      {key}: {value}")
 
     if not 0 <= gpu < len(devices):
@@ -121,7 +74,7 @@ def log_session_io(label: str, session: ort.InferenceSession) -> None:
 
 
 def to_uint8_hwc(vae_output: np.ndarray) -> np.ndarray:
-    # vae_output: (1, 3, H, W) float, normalized to [-1, 1].
+    """vae_output: (1, 3, H, W) float, normalized to [-1, 1]."""
     chw = vae_output[0].astype(np.float32)
     chw = np.clip(chw * 0.5 + 0.5, 0.0, 1.0)
     return (chw * 255.0 + 0.5).astype(np.uint8).transpose(1, 2, 0)
@@ -147,8 +100,7 @@ class Scheduler:
         sigmas = t / self.NUM_TRAIN_TIMESTEPS
         sigmas = self.SHIFT * sigmas / (1 + (self.SHIFT - 1) * sigmas)
 
-        # Transformer expects timestep in [0, 1] (0 = noise, 1 = clean), the reverse convention
-        # of the sigma schedule above.
+        # Transformer's timestep is the reverse of the sigma schedule above (0=noise, 1=clean).
         timesteps = (self.NUM_TRAIN_TIMESTEPS - sigmas * self.NUM_TRAIN_TIMESTEPS) / self.NUM_TRAIN_TIMESTEPS
         timesteps[-1] = 1.0
         return timesteps.astype(np.float32)
@@ -169,11 +121,6 @@ class ZImagePipeline:
             sess_options = ort.SessionOptions()
             sess_options.add_provider_for_devices([webgpu_device], {})
             session_kwargs = {"sess_options": sess_options}
-            # Device to bind per-step outputs (latents/noise_pred) to via IO binding, so they
-            # stay GPU-resident across the denoising loop instead of round-tripping to host
-            # memory between every model call -- mirrors the webnn-developer-preview demo's
-            # `useIOBinding` GPU-buffer tensors (index.js's createGpuTensor/gpuBuffer) and this
-            # repo's ort_playground/py/onnxruntime/llm/llm-ort.py KV-cache binding.
             self.device_type, self.device_id = "webgpu", gpu
         else:
             print("Execution provider: CPUExecutionProvider")
@@ -211,10 +158,6 @@ class ZImagePipeline:
         self.vae_pre_process_output = self.vae_pre_process.get_outputs()[0].name
         self.vae_decoder_output = self.vae_decoder.get_outputs()[0].name
 
-        # Optional NSFW check (sc_prep resizes + CLIP-normalizes the raw VAE image,
-        # safety_checker classifies it), mirroring ../run_z_image_turbo.py's --safety_checker.
-        # Loads an extra ~580 MB safety_checker model; its runtime is deliberately excluded from
-        # the pipeline's total-time metric (see run()), same as the old script.
         if self.use_safety_checker:
             sc_prep_path = os.path.join(onnx_dir, "sc_prep_model_f16.onnx")
             safety_checker_path = os.path.join(onnx_dir, "safety_checker_model_f16.onnx")
@@ -236,12 +179,7 @@ class ZImagePipeline:
             self.sc_prep_output = self.sc_prep.get_outputs()[0].name
             self.safety_checker_output = self.safety_checker.get_outputs()[0].name
 
-        # On a GPU EP, encoder_hidden_states (the padded prompt embeds) is fed to the transformer
-        # unchanged on every denoising step, but it starts life as a host numpy buffer that
-        # to_ort_value can only wrap as a CPU OrtValue (WebGPU can't allocate device memory from a
-        # numpy array -- see to_ort_value). This trivial Identity model uploads it to the device
-        # once per prompt via bind_output, so it's device-resident for the whole loop instead of
-        # re-copied host->device before each transformer call. CPU EP doesn't need it.
+        # GPU EP only: uploads prompt embeds to the device once per prompt.
         self.embeds_uploader = None
         if self.device_type != "cpu":
             self._build_embeds_uploader(session_kwargs)
@@ -250,9 +188,6 @@ class ZImagePipeline:
         self.scheduler = Scheduler()
 
     def _build_embeds_uploader(self, session_kwargs: dict) -> None:
-        # Built in-memory (no on-disk artifact) as a single-node Identity graph with no declared
-        # shape, so it passes any rank/length through unchanged; only the dtype is fixed, to match
-        # the transformer's encoder_hidden_states input (transformer_dtype).
         from onnx import helper, TensorProto
 
         elem_type = TensorProto.FLOAT16 if self.transformer_dtype == np.float16 else TensorProto.FLOAT
@@ -269,20 +204,12 @@ class ZImagePipeline:
         self.embeds_uploader_output = self.embeds_uploader.get_outputs()[0].name
 
     def to_ort_value(self, array: np.ndarray) -> ort.OrtValue:
-        # Host-side numpy buffers can only back a CPU OrtValue -- the pip onnxruntime packages
-        # don't support allocating device memory directly from a numpy array for GPU EPs like
-        # WebGPU (see llm-ort.py's module docstring). IO binding's bind_output(device_type=...)
-        # is how the device-side buffer actually gets created instead.
+        """Always backs a CPU OrtValue; GPU residency instead goes through bind_output."""
         return ort.OrtValue.ortvalue_from_numpy(array)
 
     def _run_bound(
         self, label: str, session: ort.InferenceSession, iob: "ort.IOBinding", output_names: list, inputs: dict
     ) -> list:
-        # Mirrors ort_playground's llm-ort.py: numpy inputs are bound host-side (bind_cpu_input,
-        # ORT copies them to the device itself), OrtValue inputs are already wherever a previous
-        # bind_output landed (bind_ortvalue_input, no copy), and every output is bound with
-        # bind_output(device_type=...) so ORT allocates it directly on the target device instead
-        # of the default host allocation run_with_ort_values would use.
         for name, value in inputs.items():
             if isinstance(value, np.ndarray):
                 iob.bind_cpu_input(name, value)
@@ -295,12 +222,7 @@ class ZImagePipeline:
         session.run_with_iobinding(iob)
         outputs = iob.get_outputs()
         if self.sync:
-            # WebGPU dispatch is asynchronous: run_with_iobinding only submits the compute to the
-            # GPU queue and returns immediately. IOBinding.synchronize_outputs() alone doesn't
-            # force a wait for outputs that stay device-resident -- reading each one back to
-            # host does, so that's the only reliable way to get a per-call time that reflects
-            # actual compute instead of just CPU-side submission overhead. Off by default since
-            # it serializes every step (each call blocks on the previous step's GPU work).
+            # Reading each output back forces the real GPU wait (WebGPU dispatch is async).
             iob.synchronize_outputs()
             for value in outputs:
                 value.numpy()
@@ -308,10 +230,7 @@ class ZImagePipeline:
         return outputs
 
     def _device_label(self, value: ort.OrtValue) -> str:
-        # OrtValue.device_name() only ever reports "cpu" or "cuda" -- "cuda" is a legacy label
-        # onnxruntime's python bindings use for any non-CPU OrtDevice (WebGPU/DML/ROCm/CUDA all
-        # share the same generic GPU device-type enum), not an indication it ran on CUDA. Relabel
-        # it using the EP we actually configured the pipeline with.
+        # device_name() reports "cuda" for any non-CPU device, not just actual CUDA.
         name = value.device_name()
         return self.device_type if name == "cuda" else name
 
@@ -342,10 +261,8 @@ class ZImagePipeline:
             {"input_ids": input_ids, "attention_mask": attention_mask},
         )[0]
 
-        # Slicing to the real prompt length and padding to a multiple of 32 tokens (the
-        # transformer has no attention-mask/padding logic, see build_transformer.py) needs
-        # host-side numpy; this is a one-time per-prompt cost, not part of the per-step
-        # denoising loop, so it's fine to round-trip through host memory here.
+        # Slicing to prompt length + padding to a multiple of 32 (transformer has no mask/padding
+        # logic, see build_transformer.py); a one-time per-prompt host round-trip is fine here.
         embeds = embeds_ov.numpy()[:, :seq_len, :]
         pad_len = (-embeds.shape[1]) % 32
         if pad_len:
@@ -356,10 +273,6 @@ class ZImagePipeline:
         if self.embeds_uploader is None:
             embeds_ov = self.to_ort_value(embeds)
         else:
-            # Upload the padded embeds to the device once (see _build_embeds_uploader) so
-            # encoder_hidden_states is device-resident for every transformer step, matching how
-            # latents/noise_pred stay on-device via bind_output, instead of a CPU OrtValue that
-            # ORT re-copies host->device on each call.
             embeds_ov = self._run_bound(
                 "upload_embeds", self.embeds_uploader, self.embeds_uploader_iob,
                 [self.embeds_uploader_output], {"input": embeds},
@@ -389,14 +302,12 @@ class ZImagePipeline:
 
         total_ms = 0.0
 
-        def timed(label, fn, *a):
+        def timed(label, fn, *args):
             nonlocal total_ms
             start = time.perf_counter()
-            result = fn(*a)
+            result = fn(*args)
             ms = (time.perf_counter() - start) * 1000
-            if self.sync:
-                # Without --sync these per-call numbers are meaningless (WebGPU dispatch is
-                # async -- see _run_bound), so only show them when they're actually trustworthy.
+            if self.sync:  # per-call times are only meaningful with --sync
                 print(f"{label} time: {ms:.2f} ms")
             total_ms += ms
             return result
@@ -407,8 +318,6 @@ class ZImagePipeline:
         for step in range(num_inference_steps):
             timestep = timesteps[step]
             if not self.sync:
-                # Per-call times are suppressed without --sync (they'd be meaningless -- WebGPU
-                # dispatch is async), so print step progress on its own for visibility instead.
                 print(f"step {step}/{num_inference_steps}, timestep {timestep:.4f}")
 
             noise_pred_ov = timed(f"transformer-{step}", self._run_transformer, latents_ov, timestep, prompt_embeds)
@@ -423,19 +332,13 @@ class ZImagePipeline:
         image_ov = timed("vae_decoder", self._run_vae_decoder, scaled_latents_ov)
 
         def _postprocess():
-            # image_ov.numpy() is the read that forces the final GPU sync -- keep it (and the
-            # uint8/HWC conversion) inside the timed window so total_ms always reflects the full
-            # pipeline, not just whichever step happens to force a sync first (see CHANGELOG.md).
-            # The actual PNG encode + disk write below is excluded -- that's file I/O, not part
-            # of the inference pipeline.
+            # image_ov.numpy() forces the final GPU sync; keep it inside the timed window.
             return to_uint8_hwc(image_ov.numpy())
 
         hwc = timed("postprocess", _postprocess)
         save_image(hwc, output_path)
         print(f"total time: {total_ms:.2f} ms")
 
-        # Runs after total time is reported and is NOT included in it, matching
-        # ../run_z_image_turbo.py's --safety_checker sequencing.
         if self.use_safety_checker:
             start = time.perf_counter()
             nsfw = self._run_safety_checker(image_ov)
@@ -471,8 +374,6 @@ class ZImagePipeline:
 
     def _run_vae_decoder(self, scaled_latents_ov: ort.OrtValue) -> ort.OrtValue:
         if self.vae_pre_process_dtype != self.vae_decoder_dtype:
-            # One-off dtype mismatch fixup (e.g. a float16 vae_pre_process feeding a float32
-            # vae_decoder); not part of the per-step loop, so a host round-trip is fine here.
             scaled_latents_ov = self.to_ort_value(scaled_latents_ov.numpy().astype(self.vae_decoder_dtype))
         return self._run_bound(
             "vae_decoder", self.vae_decoder, self.vae_decoder_iob, [self.vae_decoder_output],
@@ -483,8 +384,7 @@ class ZImagePipeline:
         return self._run_vae_decoder(self._run_vae_pre_process(latents_ov))
 
     def _run_safety_checker(self, image_ov: ort.OrtValue) -> bool:
-        # sc_prep's "sample" is the raw, still-normalized-to-[-1,1] VAE decoder output (not the
-        # postprocessed uint8 image) -- matches ../run_z_image_turbo.py's run_safety_checker.
+        # "sample" is the raw [-1,1] VAE output, not the postprocessed uint8 image.
         if self.vae_decoder_dtype != self.sc_prep_dtype:
             image_ov = self.to_ort_value(image_ov.numpy().astype(self.sc_prep_dtype))
         clip_input_ov = self._run_bound(
@@ -525,7 +425,7 @@ def parse_args():
         "--sync", action="store_true",
         help="Force a GPU sync after every model call for accurate per-call timing (default: off; "
         "WebGPU dispatch is otherwise async, so per-call times would only reflect submission "
-        "overhead, not real compute time -- see CHANGELOG.md).",
+        "overhead, not real compute time).",
     )
     parser.add_argument("--seed", type=int, default=42, help="Latent noise seed.")
     parser.add_argument(

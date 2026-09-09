@@ -1,3 +1,10 @@
+# -------------------------------------------------------------------------
+# Copyright (c) Microsoft Corporation.  All rights reserved.
+# Licensed under the MIT License.  See License.txt in the project root for
+# license information.
+# --------------------------------------------------------------------------
+# Modifications Copyright (C) 2026 Intel Corporation. All rights reserved.
+# --------------------------------------------------------------------------
 """Reference driver for the legacy WebNN Z-Image-Turbo bundle in `z-image-turbo-webnn/`
 (straight HF download of the `webnn/Z-Image-Turbo` bundle -- not produced by export_models.py).
 
@@ -394,7 +401,7 @@ class ZImagePipeline:
         def _postprocess():
             # image_ov.numpy() is the read that forces the final GPU sync -- keep it (and the
             # uint8/HWC conversion) inside the timed window so total_ms always reflects the full
-            # pipeline, not just whichever step happens to force a sync first (see CHANGELOG.md).
+            # pipeline, not just whichever step happens to force a sync first.
             # The actual PNG encode + disk write below is excluded -- that's file I/O, not part
             # of the inference pipeline.
             return to_uint8_hwc(image_ov.numpy())
@@ -494,7 +501,7 @@ def parse_args():
         "--sync", action="store_true",
         help="Force a GPU sync after every model call for accurate per-call timing (default: off; "
         "WebGPU dispatch is otherwise async, so per-call times would only reflect submission "
-        "overhead, not real compute time -- see CHANGELOG.md).",
+        "overhead, not real compute time).",
     )
     parser.add_argument("--seed", type=int, default=42, help="Latent noise seed.")
     parser.add_argument(

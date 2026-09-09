@@ -3,29 +3,9 @@
 # Licensed under the MIT License.  See License.txt in the project root for
 # license information.
 # --------------------------------------------------------------------------
-# Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
-# Portions of this file consist of AI generated content.
+# Modifications Copyright (C) 2026 Intel Corporation. All rights reserved.
 # --------------------------------------------------------------------------
-"""Main entry point for exporting the Z-Image-Turbo pipeline to standalone ONNX models.
-
-Self-contained experiment (see requirements.txt): every build_*.py this dispatches to
-depends only on the public onnxruntime-genai pip package, not on this repo's own
-../builders/ source tree.
-
--m/--model selects which component to build; each maps to one build_*.py's `build()`:
-    transformer    -> build_transformer.py     (implemented)
-    text_encoder   -> build_text_encoder.py    (implemented)
-    vae_decoder    -> build_vae_decoder.py     (implemented)
-    helper_models  -> build_helper_models.py   (implemented)
-    safety_checker -> build_safety_checker.py  (implemented; needs its own separate
-                       checkpoint, see --safety_checker_checkpoint)
-    all            -> every component above, in one bundle directory (safety_checker is
-                       skipped, with a message, if --safety_checker_checkpoint isn't given)
-
-Also copies the checkpoint's tokenizer files into `<output_dir>/tokenizer/` (see
-../build_z_image_turbo.py, which does the same) so the exported directory is self-contained
-and can be pointed at directly, e.g. by run_z_image_turbo.py.
-"""
+"""Main entry point for exporting the Z-Image-Turbo pipeline to standalone ONNX models."""
 
 import argparse
 import os
@@ -39,7 +19,6 @@ import build_text_encoder
 import build_transformer
 import build_vae_decoder
 
-NOT_YET_PORTED = ()
 ALL_COMPONENTS = ("transformer", "text_encoder", "vae_decoder", "helper_models", "safety_checker")
 
 # Small tokenizer files that AutoTokenizer.from_pretrained needs; they live in the checkpoint's
@@ -108,17 +87,10 @@ def build_one(model, input_path, output_dir, extra_options, safety_checker_check
         return build_safety_checker.build(
             safety_checker_checkpoint, output_dir, extra_options=build_safety_checker.parse_extra_options(extra_options)
         )
-    if model in NOT_YET_PORTED:
-        raise NotImplementedError(
-            f"-m {model} isn't ported to this standalone (pip-onnxruntime-genai-only) experiment yet. "
-            f"Use ../build_z_image_turbo.py -m {model} for the version coupled to this repo's ../builders/ tree."
-        )
     raise ValueError(f"Unknown -m/--model value: {model}")
 
 
 def resolve_tokenizer_dir(input_path):
-    # The tokenizer lives beside the text_encoder folder (repo_root/tokenizer), regardless of
-    # whether input_path is the repo root or a component subfolder itself.
     text_encoder_dir = input_path
     if os.path.isdir(os.path.join(input_path, "text_encoder")):
         text_encoder_dir = os.path.join(input_path, "text_encoder")
@@ -126,7 +98,6 @@ def resolve_tokenizer_dir(input_path):
 
 
 def _link_or_copy(src, dst):
-    # Prefer a cheap hardlink (same volume); fall back to a copy across volumes.
     if os.path.exists(dst):
         os.remove(dst)
     try:

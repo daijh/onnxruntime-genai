@@ -3,22 +3,10 @@
 # Licensed under the MIT License.  See License.txt in the project root for
 # license information.
 # --------------------------------------------------------------------------
-# Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
-# Portions of this file consist of AI generated content.
+# Modifications Copyright (C) 2026 Intel Corporation. All rights reserved.
 # --------------------------------------------------------------------------
 """Build the scheduler_step / vae_pre_process / sc_prep helper ONNX graphs for the self-built
 Z-Image-Turbo pipeline, in either float16 or float32.
-
-Self-contained port of ../builders/zimage_helper_models.py: unlike build_transformer.py /
-build_vae_decoder.py, this one never depended on onnxruntime-genai's `Model` base class in
-the first place (these graphs are hand-authored, no pretrained weights, no checkpoint input
-at all) -- only `torch`, `onnx`, `onnxruntime`, `onnxconverter_common`, and `numpy`.
-
-These mirror the tiny helper graphs the WebNN JS demo generates to keep intermediate tensors
-GPU-resident, but shaped to match the self-built transformer's `[1, 16, H, W]`
-hidden_states/sample convention instead of the WebNN bundle's `[*, 16, 1, H, W]` (no
-`num_frames` axis here), and with a genuinely float16 I/O boundary in the f16 variant (not just
-float16-internal-with-float32-boundary).
 """
 
 import argparse
@@ -58,13 +46,7 @@ def parse_extra_options(pairs):
 # Model 1 - Scheduler Step (one flow-matching Euler step + sigma calc)
 # ======================================================================
 class SchedulerStepModel(nn.Module):
-    """
-    Performs one Euler step, recomputing sigma/sigma_next internally from
-    step_info=[step, num_steps] (shift=3 schedule -- matches the deployed WebNN pipeline).
-
-    Inputs:  noise_pred [1, 16, H, W], latents [1, 16, H, W], step_info [2]
-    Output:  latents_out [1, 16, H, W]
-    """
+    """Inputs: noise_pred [1,16,H,W], latents [1,16,H,W], step_info [2]. Output: latents_out."""
 
     def __init__(self):
         super().__init__()
@@ -125,13 +107,7 @@ def numpy_scheduler_step(noise_pred, latents, step, num_steps):
 # Model 2 - VAE Pre-Process (scale/shift, no frame-axis squeeze)
 # ======================================================================
 class VaePreProcessModel(nn.Module):
-    """
-    VAE scale/shift. Our latents have no frame axis to squeeze (already [1, 16, H, W]),
-    unlike the WebNN bundle's `squeeze(axis=2) / scaling_factor + shift_factor`.
-
-    Input:  latents [1, 16, H, W]
-    Output: scaled_latents [1, 16, H, W]
-    """
+    """Input: latents [1,16,H,W]. Output: scaled_latents [1,16,H,W]."""
 
     def __init__(self):
         super().__init__()
@@ -146,16 +122,7 @@ class VaePreProcessModel(nn.Module):
 # Model 3 - sc_prep (resize + CLIP normalize, for the safety checker)
 # ======================================================================
 class ScPrepModel(nn.Module):
-    """
-    Resize the raw VAE-decoded image ([-1, 1] range) to CLIP's 224x224 input and normalize with
-    the standard OpenAI CLIP mean/std. Folds the VAE's [-1,1]->[0,1] denorm into the per-channel
-    affine (scale = 0.5/std, offset = (0.5-mean)/std) -- reverse-engineered from the deployed
-    bundle's sc_prep_model_f16.onnx (Resize mode=linear, coordinate_transformation_mode=
-    asymmetric, then Mul+Add by per-channel constants matching these exactly to 4 decimals).
-
-    Input:  sample [1, 3, H, W]      (VAE decoder output, [-1, 1] range)
-    Output: clip_input [1, 3, 224, 224]
-    """
+    """Input: sample [1,3,H,W] (VAE output, [-1,1] range). Output: clip_input [1,3,224,224]."""
 
     def __init__(self):
         super().__init__()
@@ -170,8 +137,7 @@ class ScPrepModel(nn.Module):
 
 
 def numpy_resize_asymmetric_bilinear(img, out_h, out_w):
-    # img: [C, H, W] float32. "asymmetric" coordinate transform: in_coord = out_coord * (in/out),
-    # no half-pixel centering -- matches the deployed sc_prep model's Resize attribute.
+    """img: [C, H, W] float32. "asymmetric" == in_coord = out_coord * (in/out), no half-pixel centering."""
     c, h, w = img.shape
     scale_h, scale_w = h / out_h, w / out_w
     ys = np.arange(out_h) * scale_h
@@ -189,7 +155,7 @@ def numpy_resize_asymmetric_bilinear(img, out_h, out_w):
 
 
 def numpy_sc_prep(sample):
-    # sample: [1, 3, H, W] float32
+    """sample: [1, 3, H, W] float32."""
     resized = numpy_resize_asymmetric_bilinear(sample[0], 224, 224)[None, ...]
     std = np.array(CLIP_STD, dtype=np.float32).reshape(1, 3, 1, 1)
     mean = np.array(CLIP_MEAN, dtype=np.float32).reshape(1, 3, 1, 1)
@@ -200,8 +166,6 @@ def numpy_sc_prep(sample):
 # Export helpers
 # ======================================================================
 def _force_dynamic_dim_names(onnx_model, dynamic_axes):
-    # Some torch/opset combinations don't fully honor dynamic_axes on export; patch symbolic
-    # dim names in directly as a safety net (mirrors the WebNN reference generator's approach).
     tensors = {t.name: t for t in list(onnx_model.graph.input) + list(onnx_model.graph.output)}
     for name, axes in dynamic_axes.items():
         tensor = tensors.get(name)
@@ -216,8 +180,7 @@ def _force_dynamic_dim_names(onnx_model, dynamic_axes):
 
 
 def _force_resize_asymmetric(onnx_model):
-    # torch's bilinear interpolate (align_corners=False) exports as pytorch_half_pixel; force it
-    # to asymmetric to match the deployed sc_prep model exactly (see ScPrepModel docstring).
+    # torch exports bilinear interpolate as pytorch_half_pixel; must be asymmetric here instead.
     for node in onnx_model.graph.node:
         if node.op_type != "Resize":
             continue
@@ -251,10 +214,7 @@ def export_model(model, dummy_inputs, input_names, output_names, dynamic_axes, f
 
 
 def _fix_cast_node_types(onnx_model):
-    # onnxconverter_common's float16 converter can rewrite a Cast node's declared OUTPUT type
-    # (value_info) to float16 without updating the node's own `to` attribute, leaving a
-    # Cast(to=FLOAT) node whose declared output is FLOAT16 -- onnxruntime rejects that at load
-    # ("Type Error: ... does not match expected type"). Patch `to` to match the declared type.
+    # Patches a Cast node's `to` attribute to match its (possibly f16-converted) declared output type.
     vi = {v.name: v for v in onnx_model.graph.value_info}
     for node in onnx_model.graph.node:
         if node.op_type != "Cast":
@@ -270,11 +230,7 @@ def convert_to_f16(f32_path, f16_path):
     from onnxconverter_common import float16
 
     onnx_model = onnx.load(f32_path)
-    # Resize is in onnxconverter_common's default op_block_list -- it gets left in fp32 with
-    # Cast nodes wrapped around it -- because the ONNX spec hardcodes its `scales` input to
-    # tensor(float) regardless of the data dtype. Our graphs only ever drive Resize via `sizes`
-    # (int64) with empty roi/scales, and ORT's Resize kernel natively supports float16 X/Y, so
-    # un-block just Resize to get a genuinely all-fp16 graph instead of two wasted Casts.
+    # Un-block Resize to get a genuinely all-fp16 graph instead of wrapped Casts.
     op_block_list = [op for op in float16.DEFAULT_OP_BLOCK_LIST if op != "Resize"]
     onnx_model_f16 = float16.convert_float_to_float16(
         onnx_model, keep_io_types=False, op_block_list=op_block_list
@@ -296,8 +252,6 @@ def verify_model(path, feed_dict, label):
 
 
 def build_one(name, model, dummy_inputs, input_names, output_names, dynamic_axes, out_dir, precision, verify_fn):
-    # precision is exactly "f16" or "f32". The f32 export is always produced first (it's either
-    # the final artifact or the source for the f16 conversion), then removed if not requested.
     f32_path = os.path.join(out_dir, f"{name}_f32.onnx")
     export_model(model, dummy_inputs, input_names, output_names, dynamic_axes, f32_path)
     if precision == "f32":
@@ -317,9 +271,7 @@ def build_one(name, model, dummy_inputs, input_names, output_names, dynamic_axes
 def build(input_path, output_dir, precision="f16", extra_options=None):
     """Build scheduler_step_model / vae_pre_process_model / sc_prep_model into `output_dir`/onnx.
 
-    `input_path` is unused: these graphs are hand-authored (no pretrained weights, no
-    checkpoint), unlike build_transformer.py/build_vae_decoder.py -- kept as a parameter only
-    so export_models.py can dispatch to every component's `build()` uniformly.
+    `input_path` is unused (kept so export_models.py can dispatch to every build() uniformly).
     """
     del input_path
     if precision not in PRECISION_CONFIGS:
@@ -330,8 +282,6 @@ def build(input_path, output_dir, precision="f16", extra_options=None):
     width = int(extra_options.get("width", 512))
     num_inference_steps = int(extra_options.get("num_inference_steps", 8))
 
-    # All .onnx output goes under a shared `onnx/` subdir of `output_dir`, so multiple
-    # components can land side by side in one bundle.
     onnx_dir = os.path.join(output_dir, "onnx")
     os.makedirs(onnx_dir, exist_ok=True)
     latent_h, latent_w = height // 8, width // 8
@@ -371,8 +321,6 @@ def build(input_path, output_dir, precision="f16", extra_options=None):
         ),
         ["noise_pred", "latents", "step_info"],
         ["latents_out"],
-        # batch is fixed at 1 across the whole pipeline (the transformer hardcodes batch=1);
-        # leave axis 0 out of dynamic_axes so it stays a static 1 (dummy inputs are batch=1).
         {
             "noise_pred": {2: "height", 3: "width"},
             "latents": {2: "height", 3: "width"},

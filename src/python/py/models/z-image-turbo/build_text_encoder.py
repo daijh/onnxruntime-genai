@@ -3,44 +3,9 @@
 # Licensed under the MIT License.  See License.txt in the project root for
 # license information.
 # --------------------------------------------------------------------------
-# Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
-# Portions of this file consist of AI generated content.
+# Modifications Copyright (C) 2026 Intel Corporation. All rights reserved.
 # --------------------------------------------------------------------------
-"""Build the Z-Image-Turbo text encoder ONNX graph directly from a Qwen3 HF checkpoint.
-
-Self-contained port of ../builders/zimage_text_encoder.py: that module already has no
-dependency on this repo's generic model-builder infrastructure (`Model`/`base.py`) in the
-first place -- it builds the graph directly with `onnx.helper` -- so this file only adds the
-`build()`/CLI wrapper matching the other standalone build_*.py scripts' conventions. Only
-`numpy`, `onnx`, `torch`, `transformers`, and `onnxruntime` (for
-`onnxruntime.quantization.matmul_nbits_quantizer`) are needed.
-
-The Z-Image-Turbo pipeline drives its DiT transformer with caption features taken
-from a Qwen3 language model. Rather than a full autoregressive decoder, it needs a
-single-forward encoder that maps `input_ids`/`attention_mask` to one hidden-state
-tensor (`encoder_hidden_states`): the residual stream entering the model's last
-decoder layer (equivalently, HuggingFace's `output_hidden_states=True`
-`hidden_states[-2]`).
-
-This module builds that graph directly with `onnx.helper`. It constructs only
-`num_hidden_layers - 1` decoder layers (the last layer, final norm, and lm_head are
-never built), using the same fused ops the generic builder emits for a WebGPU int4
-Qwen3 GroupQueryAttention export: `com.microsoft.GroupQueryAttention` with rotary
-embeddings fused in (`do_rotary=1`, matching the generic builder's default for any
-non-DML EP), and Q/K per-head RMSNorm kept as separate ops (not fused into GQA, so GQA
-stays at its <=12-input schema form). GQA derives each token's rotary position
-internally from `seqlens_k`/`total_seq_len` (itself derived from `attention_mask` via a
-reformatting subgraph) -- no `position_ids` input exists anywhere in this graph, external or
-internal. The mask reformat defaults to the standard `Shape`-based form (matching base.py's
-`make_attention_mask_reformatting_for_gqa`), which WebNN EP prefers; passing
-`enable_webgpu_graph=true` via `--extra_options` instead emits the Shape-free, GPU-only
-graph-capture variant for WebGPU graph capture. No KV cache graph inputs are ever emitted;
-GroupQueryAttention gets empty `past_key`/`past_value`.
-
-`dtype` ("f16" or "f32") controls the I/O and weight dtype throughout; `quantize`
-controls whether MatMul/Gather weights are int4-quantized afterward -- the two are
-independent, giving all four `f16`/`f32`/`f16_int4_quant`/`f32_int4_quant` precisions.
-"""
+"""Build the Z-Image-Turbo text encoder ONNX graph directly from a Qwen3 HF checkpoint."""
 
 import argparse
 import json
@@ -62,8 +27,6 @@ from external_data_utils import (
 
 DEFAULT_OUTPUT_DIR = "z-image-turbo-onnx"
 
-# Filename suffix per precision, matching ../build_z_image_turbo.py's TEXT_ENCODER_PRECISIONS
-# and the WebNN bundle's own naming convention (text_encoder_model_q4f16.onnx).
 PRECISION_CONFIGS = {
     "f16": {"dtype": "f16", "quantize": False, "suffix": "f16"},
     "f32": {"dtype": "f32", "quantize": False, "suffix": "f32"},
@@ -102,7 +65,6 @@ _NP_DTYPES = {"f16": np.float16, "f32": np.float32}
 
 
 def _rotary_cos_sin_tables(head_size, rope_theta, max_position_embeddings, np_dtype):
-    # Standard (non-scaled) Qwen3 RoPE: Z-Image-Turbo's checkpoint has rope_scaling=null.
     dim = head_size
     inv_freq = 1.0 / (rope_theta ** (np.arange(0, dim, 2, dtype=np.int64).astype(np.float64) / dim))
     t = np.arange(max_position_embeddings, dtype=np.float64)
@@ -123,10 +85,7 @@ class _GraphBuilder:
 
     def initializer(self, name, array):
         array = np.asarray(array)
-        # np.ascontiguousarray promotes 0-d scalars to shape (1,); keep true scalars 0-d so a
-        # scalar Gather index yields a scalar Gather output. GroupQueryAttention's
-        # total_sequence_length must be a scalar (this is the form the generic builder emits and
-        # that WebNN EP's static-shape GQA requires); a 1-D [1] length trips it up.
+        # Keep true scalars 0-d (np.ascontiguousarray would promote to shape (1,)).
         if array.ndim:
             array = np.ascontiguousarray(array)
         self.initializers.append(numpy_helper.from_array(array, name=name))
@@ -141,19 +100,7 @@ class _GraphBuilder:
 
 
 def _attention_mask_reformat(gb, attention_mask_name, enable_webgpu_graph=False):
-    # Derive GroupQueryAttention's seqlens_k/total_seq_len from the 2D attention_mask. Two
-    # variants, matching the generic builder; selected by `enable_webgpu_graph`:
-    #
-    # enable_webgpu_graph=True -- No Shape op, so every op runs on GPU (required
-    #   for WebGPU graph capture); total_seq_len comes from ReduceMax over the per-row valid
-    #   token counts:
-    #     attention_mask -> Cast(int32) -> ReduceSum(axis=1, keepdims=0) -> {Sub 1 -> seqlens_k;
-    #                                                                        ReduceMax -> total_seq_len}
-    #
-    # enable_webgpu_graph=False (default) -- total_seq_len is the (padded) sequence-length dim via a Shape op (runs on CPU).
-    #   This is the form WebNN EP prefers:
-    #     attention_mask -> ReduceSum(axis=1, keepdims=0) -> Sub 1 -> Cast(int32) -> seqlens_k
-    #     attention_mask -> Shape -> Gather(index 1) -> Cast(int32) -> total_seq_len
+    """Derive GroupQueryAttention's seqlens_k/total_seq_len from the 2D attention_mask."""
     if enable_webgpu_graph:
         mask_i32 = gb.node("Cast", [attention_mask_name], ["attn_mask_reformat/mask_i32"],
                             "attn_mask_reformat/Cast", to=TensorProto.INT32)
@@ -167,7 +114,6 @@ def _attention_mask_reformat(gb, attention_mask_name, enable_webgpu_graph=False)
                                  "attn_mask_reformat/ReduceMax", keepdims=0)
         return seqlens_k, total_seq_len
 
-    # Standard (Shape-based) form.
     axis1 = gb.const_i64("attn_mask_reformat/axis1", [1])
     mask_sum = gb.node("ReduceSum", [attention_mask_name, axis1], ["attn_mask_reformat/mask_sum"],
                         "attn_mask_reformat/ReduceSum", keepdims=0)
@@ -186,12 +132,7 @@ def _attention_mask_reformat(gb, attention_mask_name, enable_webgpu_graph=False)
 
 
 def _simplified_layernorm(gb, x, weight_name, eps, name_prefix, skip=None, need_sum=False, sum_output_name=None):
-    # skip=None -> plain SimplifiedLayerNormalization (default "" domain, axis/stash_type attrs).
-    # skip=<name> -> SkipSimplifiedLayerNormalization (com.microsoft domain): computes
-    # sum = x + skip, then Y = norm(sum). need_sum=True also returns the sum (4th output);
-    # the sum feeds the *next* layer's fused input-norm, or -- for the very last node this
-    # module builds -- becomes `encoder_hidden_states` directly (via sum_output_name, so the
-    # graph's final output tensor is produced directly by this node, no extra rename op).
+    """skip=None: plain norm. skip=<name>: SkipSimplifiedLayerNormalization."""
     inputs = [x, weight_name] if skip is None else [x, skip, weight_name]
     op_type = ("Skip" if skip is not None else "") + "SimplifiedLayerNormalization"
     domain = "com.microsoft" if skip is not None else ""
@@ -215,9 +156,7 @@ def _qk_head_norm(gb, x, weight_name, num_heads, head_size, eps, name_prefix):
 
 
 def _matmul(gb, x, weight_param, name_prefix, torch_dtype):
-    # weight_param: an HF nn.Linear weight, shape [out_features, in_features]. ONNX MatMul
-    # needs [in_features, out_features], so transpose. Qwen3 has no bias on any projection
-    # (attention_bias=false, and the MLP/output projections don't use bias either).
+    # weight_param: nn.Linear weight [out_features, in_features]; MatMul needs it transposed. No bias anywhere in Qwen3.
     weight = weight_param.detach().to(torch_dtype).numpy().T
     weight_name = gb.initializer(f"{name_prefix}.weight", weight)
     return gb.node("MatMul", [x, weight_name], [f"{name_prefix}/out"], f"{name_prefix}/MatMul")
@@ -225,20 +164,7 @@ def _matmul(gb, x, weight_param, name_prefix, torch_dtype):
 
 def _build_decoder_layer(gb, layer_id, layer, root_residual, input_ln_skip, dims,
                           seqlens_k_name, total_seq_len_name, cos_cache_name, sin_cache_name, torch_dtype):
-    """Emits one full Qwen3 decoder layer (attention + MLP).
-
-    root_residual: the residual stream entering this layer's input_layernorm (== the
-        embeddings output for layer 0, or the previous layer's `resid_before_mlp` otherwise).
-    input_ln_skip: None for layer 0 (plain SimplifiedLayerNormalization); otherwise the
-        previous layer's MLP output, fused into this layer's input_layernorm as a
-        SkipSimplifiedLayerNormalization (this is the "residual add from the previous layer,
-        fused into this layer's norm" pattern the generic builder also uses).
-
-    Returns (resid_before_mlp, mlp_output) -- both needed to build the next layer, and (for
-    the last layer this module builds) resid_before_mlp/mlp_output together are what the
-    caller feeds into one more `_simplified_layernorm(..., skip=mlp_output, need_sum=True)`
-    call (using the *next* layer's input_layernorm weight) to produce `encoder_hidden_states`.
-    """
+    """Emits one full Qwen3 decoder layer (attention + MLP). Returns (resid_before_mlp, mlp_output)."""
     num_attn_heads, num_kv_heads = dims["num_attn_heads"], dims["num_kv_heads"]
     head_size, eps = dims["head_size"], dims["rms_norm_eps"]
 
@@ -265,11 +191,6 @@ def _build_decoder_layer(gb, layer_id, layer, root_residual, input_ln_skip, dims
     q = _qk_head_norm(gb, q, qn_w, num_attn_heads, head_size, eps, f"layer{layer_id}/attn/q_norm")
     k = _qk_head_norm(gb, k, kn_w, num_kv_heads, head_size, eps, f"layer{layer_id}/attn/k_norm")
 
-    # RotaryEmbedding is fused into GroupQueryAttention (do_rotary=1) rather than emitted as
-    # separate nodes -- matching the generic builder's default for any non-DML EP
-    # (base.py's is_fused_rope_supported() returns True for webgpu). GQA derives each token's
-    # rotary position internally from seqlens_k/total_seq_len -- its position_ids input is
-    # always left empty, fused or not.
     scale = float(1.0 / np.sqrt(head_size))
     attn_out = gb.node(
         "GroupQueryAttention",
@@ -319,8 +240,7 @@ def _quantize_int4(onnx_model):
     )
     quantizer.process()
     quantized = quantizer.model.model
-    # MatMulNBitsQuantizer updates opset to 21 for int4 support, which requires IR version >= 10
-    quantized.ir_version = 10
+    quantized.ir_version = 10  # required for opset 21 (int4), which the quantizer bumps to
     return quantized
 
 
@@ -359,9 +279,7 @@ def _build_encoder_graph(checkpoint_dir, dtype="f16", enable_webgpu_graph=False)
         )
         root_residual, input_ln_skip = resid_before_mlp, mlp_out
 
-    # Tap the last layer's input_layernorm: only its residual-sum (4th) output is needed --
-    # the normalized-for-attention output (Y) is computed but left unconsumed, since we never
-    # run that layer's attention. Requires only that one layer's input_layernorm.weight.
+    # Tap the last layer's input_layernorm sum output only; its attention is never run.
     tap_id = num_layers - 1
     tap_ln_w = gb.initializer(
         f"model.layers.{tap_id}.input_layernorm.weight",
@@ -373,8 +291,6 @@ def _build_encoder_graph(checkpoint_dir, dtype="f16", enable_webgpu_graph=False)
     )
     assert encoder_hidden_states is not None  # guaranteed by need_sum=True with a non-None skip
 
-    # batch is fixed at 1 across the whole pipeline (the transformer hardcodes batch=1), so
-    # pin it here too -- a static leading dim helps ORT's graph optimizations.
     graph_inputs = [
         helper.make_tensor_value_info(input_ids_name, TensorProto.INT64, [1, "sequence_length"]),
         helper.make_tensor_value_info(attn_mask_name, TensorProto.INT64, [1, "total_sequence_length"]),
@@ -397,8 +313,6 @@ def export_qwen3_text_encoder(checkpoint_dir, output_onnx_path, quantize, dtype=
 
     out_dir = os.path.dirname(os.path.abspath(output_onnx_path)) or "."
     os.makedirs(out_dir, exist_ok=True)
-    # Same save path as the transformer: small (<= 1 MiB) weights inline for ORT graph
-    # transformations, larger weights sharded into `< 1.9 GiB` `.onnx_data[_N]` files.
     save_ir_model_sharded(
         ir.from_proto(onnx_model), out_dir, os.path.basename(output_onnx_path),
         size_threshold_bytes=INLINE_SIZE_THRESHOLD_BYTES,
@@ -413,8 +327,6 @@ def build(input_path, output_dir, precision="f16_int4_quant", extra_options=None
         raise ValueError(f"Unknown precision '{precision}'; choose from {sorted(PRECISION_CONFIGS)}")
     config = PRECISION_CONFIGS[precision]
 
-    # `enable_webgpu_graph=true` selects the GPU-only, Shape-free graph-capture mask reformat;
-    # anything else (the default) uses the standard Shape-based form that WebNN EP prefers.
     extra_options = extra_options or {}
     enable_webgpu_graph = str(extra_options.get("enable_webgpu_graph", "false")).lower() not in ("false", "0", "")
 
