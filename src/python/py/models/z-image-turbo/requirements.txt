@@ -1,54 +1,14 @@
-# Dependencies for export_models.py and the build_*.py exporters ONLY (transformer, text
-# encoder, VAE decoder, helper models, safety checker). For running inference against an
-# exported model (run_z_image_turbo.py / run_z_image_turbo_legacy.py), see requirements-run.txt
-# instead -- the run scripts never import onnxruntime_genai, onnx, torch's export machinery, or
-# diffusers, so they don't need this file's onnxruntime-genai/onnx/onnx-ir/diffusers/tqdm/
-# onnxconverter-common entries.
-#
-# Unlike ../builders/zimage*.py (which reach into this repo's own ../builders/base.py), these
-# build_*.py scripts depend only on the *public* onnxruntime-genai package for their `Model`
-# base class, so each one runs standalone with just `pip install -r requirements.txt` -- no
-# onnxruntime-genai checkout required. Only ships wheels for Python 3.11/3.12/3.13 -- use one
-# of those interpreters.
-#
-# Every pin below is the latest version on PyPI as of 2026-09-07, except onnx-ir (see its own
-# comment) -- verified in this session: build_transformer.py, build_text_encoder.py,
-# build_vae_decoder.py, build_helper_models.py, and build_safety_checker.py all still build and
-# run correctly against these exact versions.
-onnxruntime-genai==0.15.2
+# CPU-only build: avoids pulling in nvidia-*-cu12 CUDA packages.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.14.0+cpu
 
-# onnxruntime-genai's `Model` base class imports these itself (int4 MatMulNBits quantization
-# lives in `onnxruntime`, a separate package from `onnxruntime-genai`; `transformers`/`tqdm`
-# are imported unconditionally even though the transformer trunk doesn't use HF
-# AutoConfig/AutoTokenizer). build_text_encoder.py also uses
-# `onnxruntime.quantization.matmul_nbits_quantizer` and `transformers.AutoModelForCausalLM`
-# directly.
+onnxruntime-genai==0.15.2
 onnxruntime==1.29.0
 transformers==5.16.1
 tqdm==4.70.0
-
-# build_text_encoder.py loads the Qwen3 encoder with `low_cpu_mem_usage=True`; without
-# `accelerate` installed, transformers ignores that flag (falling back to
-# `low_cpu_mem_usage=False`) and prints a warning. Install it for faster, less
-# memory-intense weight loading during export.
 accelerate==1.14.0
-
 onnx==1.22.0
-# 1.0.0 required: external_data_utils.save_ir_model_sharded passes `max_shard_size_bytes` to
-# `ir.save`, a parameter only added in onnx-ir 1.0.0 (the 0.2.x `ir.save` signature has no such
-# argument and raises TypeError). onnxruntime-genai's `Model` base class also builds its IR graph
-# through this package internally.
 onnx-ir==1.0.0
-
-# CPU-only build: the default PyPI `torch` wheel bundles/depends on nvidia-*-cu12 CUDA
-# packages even though these exporters only trace/export on CPU. `--extra-index-url` pulls
-# the `+cpu` variant from PyTorch's own index instead (cp311/cp312/cp313 only, matching this
-# file's supported interpreters).
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.14.0+cpu
 diffusers==0.40.0
 numpy==2.5.3
-
-# build_helper_models.py's / build_safety_checker.py's f16 conversion pass (no
-# Model/onnxruntime-genai dependency there).
 onnxconverter-common==1.16.0
